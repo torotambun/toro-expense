@@ -4,6 +4,13 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Expense Reports</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icons/icon-180.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Expenses">
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#10191e" media="(prefers-color-scheme: dark)">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Source+Serif+4:opsz,wght@8..60,600&display=swap" rel="stylesheet">
 <style>
@@ -113,6 +120,7 @@ details{margin:0 0 14px}summary{cursor:pointer;min-height:44px;display:flex;alig
 <div id="toast" role="status" hidden></div>
 <input class="vh" type="file" id="cam" accept="image/*" capture="environment" tabindex="-1">
 <input class="vh" type="file" id="lib" accept="image/*" tabindex="-1">
+<input class="vh" type="file" id="restore" accept="application/json,.json" tabindex="-1">
 <script src="lib/jspdf.umd.min.js"></script>
 <script src="lib/jspdf.plugin.autotable.min.js"></script>
 <script src="lib/xlsx.mini.min.js"></script>
@@ -166,7 +174,9 @@ const DEFAULTS = () => ({
 const merge = d => { const o = DEFAULTS(); for (const k in o) if (d && d[k] != null) o[k] = clone(d[k]); return o; };
 
 const S = {settings: DEFAULTS(), reports: {}, ready: false, slow: false, curId: null, err: ''};
-const cap = {sample: null, images: false, downloads: null, viewer: false};
+const cap = {sample: null, images: false, downloads: null, viewer: false, key: '', model: 'claude-sonnet-5-5'};
+const MODELS = [['claude-sonnet-5-5', 'Claude Sonnet 5.5 (balanced)'], ['claude-haiku-5-5', 'Claude Haiku 5.5 (fastest, lowest cost)'], ['claude-opus-5-5', 'Claude Opus 5.5 (most capable)']];
+const canRead = () => !!(cap.sample && cap.images) || (!cap.viewer && !!cap.key);
 try { S.curId = sessionStorage.getItem('xp.cur'); } catch (e) {}
 
 const codeOf = c => S.settings.codes.find(x => x.code === c);
@@ -180,10 +190,20 @@ const projectList = () => [...new Set(recent().map(r => r.project).filter(Boolea
 const lastRate = (c, base) => { for (const r of Object.values(S.reports).sort((a, b) => (b.updatedAt || '').localeCompare(a.updatedAt || ''))) if (r.currency === base) for (const rc of (r.receipts || []).slice().reverse()) if (rc.currency === c && +rc.rate > 0) return +rc.rate; return 0; };
 
 /* ---------- storage: Claude storage when available, this browser otherwise ---------- */
+const idb = {
+  db: null,
+  open() { return new Promise((ok, no) => { const q = indexedDB.open('expense-reports', 1); q.onupgradeneeded = () => { for (const n of ['kv', 'reports', 'images']) if (!q.result.objectStoreNames.contains(n)) q.result.createObjectStore(n); }; q.onsuccess = () => { this.db = q.result; ok(); }; q.onerror = () => no(q.error); }); },
+  tx(n, mode, fn) { return new Promise((ok, no) => { const t = this.db.transaction(n, mode), q = fn(t.objectStore(n)); t.oncomplete = () => ok(q && q.result); t.onerror = t.onabort = () => no(t.error); }); },
+  get(n, k) { return this.tx(n, 'readonly', o => o.get(k)); },
+  all(n) { return this.tx(n, 'readonly', o => o.getAll()); },
+  put(n, k, v) { return this.tx(n, 'readwrite', o => o.put(v, k)); },
+  del(n, k) { return this.tx(n, 'readwrite', o => o.delete(k)); },
+  clear(n) { return this.tx(n, 'readwrite', o => o.clear()); }
+};
 const queue = {};
 const enqueue = (key, fn) => (queue[key] = (queue[key] || Promise.resolve()).catch(() => {}).then(fn));
 const store = {
-  mode: 'local', db: null, me: null, assets: null, img: new Map(),
+  mode: 'local', db: null, me: null, assets: null, idb: false, persisted: false, img: new Map(),
   p() { const b = 'data/users/' + this.me; const s = this.db.doc(b + '/store'); return {settings: this.db.doc(b + '/settings'), reports: s.collection('reports'), images: s.collection('images')}; },
   async init({db, uid, assets}) {
     this.assets = assets || null;
@@ -197,10 +217,19 @@ const store = {
       p.settings.onSnapshot(snap => { if (snap.exists) S.settings = merge(snap.data()); got.s = true; done(); }, fail);
       p.reports.onSnapshot(q => { const m = {}; q.docs.forEach(d => { m[d.id] = clone(d.data()); }); S.reports = m; got.r = true; done(); }, fail);
     } else {
+      /* outside Claude: everything stays on this device, in the browser's database */
       try {
-        S.settings = merge(JSON.parse(localStorage.getItem('xp.settings') || 'null'));
-        S.reports = JSON.parse(localStorage.getItem('xp.reports') || '{}') || {};
-      } catch (e) {}
+        await idb.open(); this.idb = true;
+        S.settings = merge(await idb.get('kv', 'settings'));
+        S.reports = Object.fromEntries((await idb.all('reports')).map(r => [r.id, r]));
+        if (navigator.storage && navigator.storage.persist) navigator.storage.persist().then(ok => { this.persisted = ok; }).catch(() => {});
+      } catch (e) {
+        this.idb = false;
+        try {
+          S.settings = merge(JSON.parse(localStorage.getItem('xp.settings') || 'null'));
+          S.reports = JSON.parse(localStorage.getItem('xp.reports') || '{}') || {};
+        } catch (e2) {}
+      }
       S.ready = true; render();
     }
   },
@@ -208,16 +237,19 @@ const store = {
   saveSettings() {
     const s = clone(S.settings);
     if (this.mode === 'cloud') return enqueue('settings', () => this.p().settings.set(s)).catch(saveErr);
+    if (this.idb) return enqueue('settings', () => idb.put('kv', 'settings', s)).catch(saveErr);
     this.local(); return Promise.resolve();
   },
   saveReport(r) {
     r.updatedAt = new Date().toISOString(); const body = clone(r); S.reports[r.id] = body;
     if (this.mode === 'cloud') return enqueue('r:' + r.id, () => this.p().reports.doc(r.id).set(body)).catch(saveErr);
+    if (this.idb) return enqueue('r:' + r.id, () => idb.put('reports', r.id, body)).catch(saveErr);
     this.local(); return Promise.resolve();
   },
   deleteReport(id) {
     delete S.reports[id];
     if (this.mode === 'cloud') return enqueue('r:' + id, () => this.p().reports.doc(id).delete()).catch(saveErr);
+    if (this.idb) return enqueue('r:' + id, () => idb.del('reports', id)).catch(saveErr);
     this.local(); return Promise.resolve();
   },
   async putImage(blob) {
@@ -225,6 +257,7 @@ const store = {
       try { const a = await this.assets.upload(blob, {type: 'image/jpeg'}); this.img.set('a:' + a.id, a.url); return 'a:' + a.id; }
       catch (e) { console.warn('asset upload failed', e && e.code); }
     }
+    if (this.mode === 'local' && this.idb) { const id = newId(); await idb.put('images', id, {type: blob.type || 'image/jpeg', buf: await blob.arrayBuffer()}); this.img.set('l:' + id, URL.createObjectURL(blob)); return 'l:' + id; }
     let small = await shrink(blob, 1000, 0.6), data = await toDataURL(small);
     if (data.length > 230000) { small = await shrink(blob, 760, 0.5); data = await toDataURL(small); }
     const id = newId();
@@ -238,6 +271,7 @@ const store = {
     const id = ref.slice(2); let u = '';
     if (ref[0] === 'a') u = '/_blob/' + id;
     else if (ref[0] === 'd' && this.mode === 'cloud') { try { const s = await this.p().images.doc(id).get(); u = s.exists ? (s.data().data || '') : ''; } catch (e) {} }
+    else if (this.idb) { try { const x = await idb.get('images', id); u = x ? URL.createObjectURL(new Blob([x.buf], {type: x.type})) : ''; } catch (e) {} }
     else { try { u = localStorage.getItem('xp.img.' + id) || ''; } catch (e) {} }
     if (u) this.img.set(ref, u);
     return u;
@@ -247,6 +281,7 @@ const store = {
     try {
       if (ref[0] === 'a' && this.assets) await this.assets.delete(id);
       else if (ref[0] === 'd' && this.mode === 'cloud') await this.p().images.doc(id).delete();
+      else if (this.idb) await idb.del('images', id);
       else localStorage.removeItem('xp.img.' + id);
       return true;
     } catch (e) { console.warn('image delete failed', e && e.code); return false; }
@@ -335,11 +370,31 @@ const READ_ERR = {
   rate_limited: 'Claude is busy or the usage limit is reached. Try reading again in a little while, or fill the fields by hand.',
   session_expired: 'The Claude session has expired. Sign in again, then retry.',
   image_rejected: 'The photo could not be used. Try another photo.',
-  refused: 'Claude declined to read this photo. The fields can be filled by hand.'
+  refused: 'Claude declined to read this photo. The fields can be filled by hand.',
+  no_key: 'Receipt reading needs an Anthropic API key, which is added under Setup. Until then the fields are filled by hand.',
+  bad_key: 'The API key was not accepted. Check the key under Setup.',
+  no_credit: 'The API account has no credit left. Add credit in the Anthropic Console, then read again.',
+  bad_model: 'The chosen model is not available for this API key. Choose another model under Setup.',
+  offline: 'The Anthropic API could not be reached. Check the internet connection, then read again.',
+  api_error: 'The Anthropic API refused the request. The fields can be filled by hand.'
 };
+/* outside Claude the photo goes straight from this device to the Anthropic API, with the key kept on this device */
+async function apiRead(blob, r, signal) {
+  let res, data = null;
+  try {
+    res = await fetch('https://api.anthropic.com/v1/messages', {method: 'POST', signal,
+      headers: {'content-type': 'application/json', 'x-api-key': cap.key, 'anthropic-version': '2023-06-01', 'anthropic-dangerous-direct-browser-access': 'true'},
+      body: JSON.stringify({model: cap.model, max_tokens: 2500, messages: [{role: 'user', content: [{type: 'image', source: {type: 'base64', media_type: 'image/jpeg', data: (await toDataURL(blob)).split(',')[1]}}, {type: 'text', text: readPrompt(r)}]}]})});
+  } catch (e) { throw {code: e && e.name === 'AbortError' ? 'cancelled' : 'offline'}; }
+  try { data = await res.json(); } catch (e) {}
+  if (!res.ok) { const m = String((data && data.error && data.error.message) || ''); throw {code: res.status === 401 || res.status === 403 ? 'bad_key' : res.status === 429 ? 'rate_limited' : res.status === 404 ? 'bad_model' : /credit|billing/i.test(m) ? 'no_credit' : res.status >= 500 ? 'upstream_error' : 'api_error', message: m.slice(0, 200)}; }
+  const text = ((data && data.content) || []).filter(c => c.type === 'text').map(c => c.text).join('\n'), a = text.indexOf('{'), z = text.lastIndexOf('}');
+  try { return JSON.parse(text.slice(a, z + 1)); } catch (e) { throw {code: 'invalid_json'}; }
+}
 async function readReceipt(blob, r, signal) {
-  if (!cap.sample || !cap.images) throw {code: 'images_unavailable'};
-  return normalise(await cap.sample.json(readPrompt(r), {images: [blob], signal}), r);
+  if (cap.sample && cap.images) return normalise(await cap.sample.json(readPrompt(r), {images: [blob], signal}), r);
+  if (!cap.viewer && cap.key) return normalise(await apiRead(blob, r, signal), r);
+  throw {code: cap.viewer ? 'images_unavailable' : 'no_key'};
 }
 function sampleReceipt() {
   const c = document.createElement('canvas'); c.width = 640; c.height = 900; const g = c.getContext('2d');
@@ -420,7 +475,28 @@ async function deliver(filename, blob) {
     return;
   }
   if (cap.viewer) return toast('File export is not available in this view.');
-  const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = filename; document.body.append(a); a.click(); a.remove();
+  if (ready) URL.revokeObjectURL(ready.url);
+  ready = {name: filename, file: new File([blob], filename, {type: blob.type}), url: URL.createObjectURL(blob)};
+  let share = false; try { share = !!(navigator.canShare && navigator.canShare({files: [ready.file]})); } catch (e) {}
+  openSheet('File ready', '<p><b>' + esc(filename) + '</b><br><span class="mut sm">' + Math.max(1, Math.round(blob.size / 1024)) + ' kB</span></p>' +
+    (share ? '<p class="mut sm">"Save or share" opens the share sheet. "Save to Files" there stores the file in iCloud Drive or on the device.</p>' : '') +
+    '<div class="btns">' + (share ? '<button class="btn pri" data-act="share-file">Save or share</button>' : '') + '<a class="btn' + (share ? ' quiet' : ' pri') + '" href="' + ready.url + '" download="' + esc(filename) + '">Download</a></div>');
+}
+let ready = null;
+/* backup of everything on this device: setup, reports and receipt photos in one file */
+async function buildBackup() {
+  const images = {};
+  for (const r of Object.values(S.reports)) for (const rc of (r.receipts || [])) if (rc.img) { try { images[rc.img] = await toDataURL(await (await fetch(await store.imageUrl(rc.img))).blob()); } catch (e) {} }
+  return new Blob([JSON.stringify({app: 'expense-reports', version: 1, savedAt: new Date().toISOString(), settings: S.settings, reports: S.reports, images})], {type: 'application/json'});
+}
+let pendingRestore = null;
+async function readBackup(file) {
+  try {
+    const d = JSON.parse(await file.text());
+    if (!d || d.app !== 'expense-reports' || typeof d.reports !== 'object') throw new Error('not a backup');
+    pendingRestore = d; const n = Object.keys(d.reports).length;
+    openSheet('Restore backup', '<p>Backup saved on <b>' + esc(fd(String(d.savedAt || '').slice(0, 10)) || 'an unknown date') + '</b> with <b>' + n + (n === 1 ? ' report' : ' reports') + '</b> and ' + Object.keys(d.images || {}).length + ' receipt photos.</p><p class="note bad">Restoring replaces every report, receipt photo and setup choice now on this device.</p><div class="btns"><button class="btn danger" data-act="do-restore">Replace all data</button></div>');
+  } catch (e) { toast('This file is not a backup of the expense app.'); }
 }
 
 /* ---------- views ---------- */
@@ -440,7 +516,7 @@ function viewList() {
   const rows = rs.map(r => { const k = calc(r); return '<li><button class="rep" data-act="open" data-id="' + esc(r.id) + '"><span class="no">' + esc(r.number) + ' <span class="chip ' + (r.status === 'submitted' ? 'ok' : '') + '">' + (r.status === 'submitted' ? 'Submitted' : 'Draft') + '</span></span><span class="amt">' + esc(money(k.total, r.currency)) + '</span><span class="sm">' + esc(r.project || 'No project') + '</span><span class="sm mut r">' + k.count + (k.count === 1 ? ' receipt' : ' receipts') + '</span><span class="sm mut">' + esc(r.entityName) + '</span><span class="sm mut r">' + esc(fd(r.from)) + ' to ' + esc(fd(r.to)) + '</span></button></li>'; }).join('');
   return '<div class="head"><h1>Reports</h1><button class="btn pri" data-act="new">New report</button></div>' +
     (rs.length ? '<ul class="list">' + rows + '</ul>' : '<div class="empty"><h2>No reports yet</h2><p class="mut">A report belongs to one entity and one project. Its number is assigned on creation, and receipts are added by photo afterwards.</p><button class="btn pri" data-act="new">Start the first report</button></div>') +
-    (store.mode === 'local' ? '<p class="note">Reports are saved in this browser only. Opened inside Claude, the page saves them to Claude storage and shows them on every device.</p>' : '');
+    (store.mode === 'local' ? '<p class="note">Reports are saved on this device only. A backup file can be made under Setup.</p>' : '');
 }
 function viewReport(r) {
   const k = calc(r), open = r.status !== 'submitted';
@@ -458,7 +534,7 @@ function viewReport(r) {
     '<div class="total"><span>Total claim, ' + k.count + (k.count === 1 ? ' receipt' : ' receipts') + '</span><b>' + esc(money(k.total, r.currency)) + '</b></div>' +
     (k.missing ? '<p class="note bad">' + k.missing + (k.missing === 1 ? ' receipt has' : ' receipts have') + ' no exchange rate yet, so the total is incomplete and export is locked.</p>' : '') +
     (open ? '<div class="btns fill"><label class="btn pri" for="cam">Take photo of receipt</label><label class="btn" for="lib">Choose a photo</label><button class="btn quiet" data-act="manual">Enter by hand</button></div>' +
-      (cap.sample && cap.images ? '' : '<p class="note">Automatic receipt reading is not available in this view. A photo is still stored with the receipt, and the fields are filled by hand.</p>') : '') +
+      (canRead() ? '' : '<p class="note">' + (cap.viewer ? 'Automatic receipt reading is not available in this view.' : 'Automatic receipt reading needs an Anthropic API key, which is added under Setup.') + ' A photo is still stored with the receipt, and the fields are filled by hand.</p>') : '') +
     '<section><h2>Receipts</h2>' + (groups.length ? '<ul class="list">' + list + '</ul>' : '<p class="mut">No receipts yet. A photo of a receipt fills in the merchant, date, amount, category and any alcohol portion.</p>') + '</section>' +
     (groups.length ? '<section><h2>Summary by expense code</h2><table><thead><tr><th>Code</th><th>Category</th><th class="r">' + esc(r.currency) + '</th></tr></thead><tbody>' + sum + '</tbody><tfoot><tr><td></td><td>Total</td><td class="r num">' + esc(fmt(k.total, r.currency)) + '</td></tr></tfoot></table></section>' : '') +
     '<section><h2>Submit</h2><div class="btns fill"><button class="btn pri" data-act="pdf"' + (!groups.length || k.missing ? ' disabled' : '') + '>PDF with receipts</button><button class="btn" data-act="xlsx"' + (!groups.length || k.missing ? ' disabled' : '') + '>Excel file</button></div>' +
@@ -473,7 +549,13 @@ function viewSetup() {
     '<section><h2>Entities</h2><p class="mut sm">Each entity has its own report currency and its own number series, in the form PREFIX-YEAR-0001.</p><div id="ents">' + ents + '</div><button class="btn quiet" type="button" data-act="add-ent">Add an entity</button></section>' +
     '<section class="codes"><h2>Expense codes</h2><p class="mut sm">A general travel and entertainment chart. Codes and names can be changed to match the books. One code is marked to receive the alcohol portion of receipts.</p><div class="row hd"><span>Code</span><span>Category name</span><span>Alcohol</span><span></span></div><div id="codes">' + codes + '</div><div class="btns"><button class="btn quiet" type="button" data-act="add-code">Add a code</button><button class="btn quiet" type="button" data-act="reset-codes">Restore the standard chart</button></div></section>' +
     '<section><button class="btn pri" type="button" data-act="save-setup">Save setup</button></section></form>' +
-    '<section><h2>Status</h2><ul class="st">' + st(store.mode === 'cloud', store.mode === 'cloud' ? 'Reports are saved to Claude storage and appear on every device.' : 'Reports are saved in this browser only.') + st(cap.sample && cap.images, cap.sample && cap.images ? 'Receipt photos are read by Claude.' : 'Automatic receipt reading is not available in this view.') + st(!!store.assets, store.assets ? 'Receipt photos are stored at full quality.' : 'Receipt photos are stored in reduced size.') + st(!!cap.downloads || !cap.viewer, cap.downloads || !cap.viewer ? 'PDF and Excel export is available.' : 'File export is not available in this view.') + '</ul>' +
+    (cap.viewer ? '' : '<section><h2>Receipt reading</h2><p class="mut sm">Outside Claude, receipt photos are read through an Anthropic API key. The key is kept only in this browser on this device and is sent only to api.anthropic.com. Each reading is charged to the account that owns the key.</p>' +
+      '<label class="f">API key<span class="h">' + (cap.key ? 'A key is saved. A new entry replaces it.' : 'Created in the Anthropic Console. It starts with sk-ant.') + '</span><input id="k-key" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="' + (cap.key ? 'Saved' : 'sk-ant-...') + '"></label>' +
+      '<label class="f">Model<select id="k-model">' + MODELS.map(m => '<option value="' + m[0] + '"' + (m[0] === cap.model ? ' selected' : '') + '>' + m[1] + '</option>').join('') + '</select></label>' +
+      '<div class="btns"><button class="btn pri" type="button" data-act="save-key">Save key and model</button>' + (cap.key ? '<button class="btn danger" type="button" data-act="del-key">Remove key</button>' : '') + '</div></section>' +
+      '') +
+    '<section><h2>Backup</h2><p class="mut sm">' + (cap.viewer ? 'A backup file holds the setup, all reports and all receipt photos. It can be restored into the installed version of this app.' : 'Everything is stored on this device only. A backup file holds the setup, all reports and all receipt photos, and can be saved to iCloud Drive. The API key is not included.') + '</p><div class="btns"><button class="btn" type="button" data-act="backup">Make a backup file</button>' + (cap.viewer ? '' : '<label class="btn quiet" for="restore">Restore from a backup file</label>') + '</div></section>' +
+    '<section><h2>Status</h2><ul class="st">' + st(store.mode === 'cloud' || store.idb, store.mode === 'cloud' ? 'Reports are saved to Claude storage and appear on every device.' : store.idb ? 'Reports are saved on this device only.' : 'Reports are saved in this browser\'s small storage, which may not hold many photos.') + st(canRead(), canRead() ? (cap.viewer ? 'Receipt photos are read by Claude.' : 'Receipt photos are read by Claude through the saved API key.') : cap.viewer ? 'Automatic receipt reading is not available in this view.' : 'Receipt reading is off until an API key is saved.') + st(!!store.assets || store.idb, store.assets || store.idb ? 'Receipt photos are stored at full quality.' : 'Receipt photos are stored in reduced size.') + st(!!cap.downloads || !cap.viewer, cap.downloads || !cap.viewer ? 'PDF and Excel export is available.' : 'File export is not available in this view.') + '</ul>' +
     '<h3 style="margin-top:18px">Self check</h3><p class="mut sm">Reads a built-in sample receipt of SGD 151.07 that includes wine and beer and compares the result with the known figures. Then stores the sample photo, builds a PDF and an Excel file from it, and removes the photo again. Nothing is added to the reports.</p><button class="btn" type="button" data-act="selftest">Run the self check</button><div id="selftest"></div></section>' +
     '<datalist id="curs">' + CURS.map(c => '<option value="' + c + '">').join('') + '</datalist>';
 }
@@ -552,7 +634,7 @@ async function runRead(mine) {
   } catch (e) {
     if (E !== mine) return;
     if (e && e.code === 'cancelled') mine.msg = '';
-    else { mine.msg = READ_ERR[e && e.code] || 'The receipt could not be read automatically. The fields can be filled by hand.'; mine.bad = true; mine.retry = !['not_granted', 'sampling_disabled', 'images_unavailable'].includes(e && e.code) && !!(cap.sample && cap.images); }
+    else { mine.msg = READ_ERR[e && e.code] || 'The receipt could not be read automatically. The fields can be filled by hand.'; mine.bad = true; mine.retry = !['not_granted', 'sampling_disabled', 'images_unavailable', 'no_key'].includes(e && e.code) && canRead(); }
   }
   mine.reading = false; rcSheet();
 }
@@ -570,7 +652,7 @@ async function selfTest(btn) {
   const rows = []; let ref = '';
   const step = async (name, fn) => { try { rows.push([name, await fn(), true]); } catch (e) { rows.push([name, (e && (e.code || e.message)) || 'error', false]); } };
   const kb = b => Math.max(1, Math.round(b.size / 1024)) + ' kB';
-  await step('Photo stored', async () => { ref = await store.putImage(await sampleReceipt()); return ref[0] === 'a' ? 'Full quality' : 'Reduced size'; });
+  await step('Photo stored', async () => { ref = await store.putImage(await sampleReceipt()); return ref[0] === 'a' || (ref[0] === 'l' && store.idb) ? 'Full quality' : 'Reduced size'; });
   const r = {number: 'TEST-0000', entityName: 'Self test', currency: 'SGD', project: 'Self test', from: today(), to: today(), name: '', institution: '', position: '', status: 'draft',
     receipts: [{id: 't', date: '2026-11-14', merchant: 'Harbour Lane Kitchen', purpose: 'Sample receipt', code: (S.settings.codes.find(c => c.meal) || S.settings.codes[0]).code, currency: 'SGD', total: 151.07, alcohol: 57.55, rate: 0, img: ref}]};
   await step('Photo loaded back', async () => { if (!ref) throw new Error('no photo'); store.img.delete(ref); const im = await loadImg(await store.imageUrl(ref)), c = document.createElement('canvas'); c.width = im.naturalWidth; c.height = im.naturalHeight; c.getContext('2d').drawImage(im, 0, 0); c.toDataURL('image/jpeg', 0.5); return im.naturalWidth + ' x ' + im.naturalHeight; });
@@ -644,7 +726,29 @@ const acts = {
   'add-ent'() { const keep = readSetup(true); S.settings.entities = keep.entities.concat({id: 'E' + newId().slice(-5).toUpperCase(), name: '', prefix: '', currency: 'SGD'}); S.settings.codes = keep.codes; render(); },
   'del-ent'(b) { if (!armed(b)) return; b.closest('.ent').remove(); },
   'save-setup'() { const x = readSetup(false); if (!x) return; S.settings.entities = x.entities; S.settings.codes = x.codes; store.saveSettings(); render(); toast('Setup saved.'); },
-  selftest(b) { selfTest(b); }
+  selftest(b) { selfTest(b); },
+  'save-key'() {
+    const k = $('#k-key').value.trim(), m = $('#k-model').value;
+    if (k && !/^sk-ant-[\w-]{10,}$/.test(k)) return toast('This does not look like an Anthropic API key. It starts with sk-ant.');
+    try { if (k) localStorage.setItem('xp.key', k); localStorage.setItem('xp.model', m); } catch (e) { return toast('This browser refused to save the key.'); }
+    if (k) cap.key = k; cap.model = m; render(); toast(k ? 'Key and model saved on this device.' : 'Model saved.');
+  },
+  'del-key'(b) { if (!armed(b)) return; try { localStorage.removeItem('xp.key'); } catch (e) {} cap.key = ''; render(); toast('Key removed from this device.'); },
+  async 'share-file'() { if (!ready) return; try { await navigator.share({files: [ready.file], title: ready.name}); } catch (e) { if (!e || e.name !== 'AbortError') toast('Sharing did not work here. The Download button is the alternative.'); } },
+  async backup(b) { b.disabled = true; try { await deliver('expense-backup-' + today() + '.json', await buildBackup()); } catch (e) { console.error(e); toast('The backup could not be made.'); } if (b.isConnected) b.disabled = false; },
+  async 'do-restore'(b) {
+    const d = pendingRestore; if (!d) return; if (!store.idb) { closeSheet(); return toast('This browser cannot hold a restored backup.'); } b.disabled = true; b.textContent = 'Restoring…';
+    try {
+      for (const n of ['kv', 'reports', 'images']) await idb.clear(n);
+      await idb.put('kv', 'settings', merge(d.settings));
+      for (const r of Object.values(d.reports)) if (r && r.id) await idb.put('reports', r.id, r);
+      for (const [ref, data] of Object.entries(d.images || {})) { const blob = await (await fetch(data)).blob(); await idb.put('images', ref.slice(2), {type: blob.type || 'image/jpeg', buf: await blob.arrayBuffer()}); }
+      /* photos from a backup made inside Claude carry other references; point them at the local copies */
+      for (const r of Object.values(d.reports)) { let ch = false; for (const rc of (r.receipts || [])) if (rc.img && rc.img[0] !== 'l' && d.images && d.images[rc.img]) { rc.img = 'l:' + rc.img.slice(2); ch = true; } if (ch) await idb.put('reports', r.id, r); }
+      S.settings = merge(d.settings); S.reports = Object.fromEntries(Object.values(d.reports).filter(r => r && r.id).map(r => [r.id, r])); store.img.clear(); pendingRestore = null; S.curId = null;
+      closeSheet(); go('reports'); toast('Backup restored.');
+    } catch (e) { console.error(e); toast('The backup could not be restored completely.'); closeSheet(); }
+  }
 };
 function readSetup(quiet) {
   const bad = t => { if (!quiet) toast(t); return null; };
@@ -662,6 +766,7 @@ function readSetup(quiet) {
 }
 document.addEventListener('click', e => { const b = e.target.closest('[data-act]'); if (b && !b.disabled && acts[b.dataset.act]) acts[b.dataset.act](b, e); });
 sheet.addEventListener('input', syncRc);
+$('#restore').addEventListener('change', e => { const f = e.target.files && e.target.files[0]; e.target.value = ''; if (f) readBackup(f); });
 for (const id of ['cam', 'lib']) $('#' + id).addEventListener('change', e => { const f = e.target.files && e.target.files[0]; e.target.value = ''; if (f) addFromFile(f); });
 /* a photo dragged onto an open draft report is treated like a chosen photo (desktop use) */
 document.addEventListener('dragover', e => { if (route() === 'report') e.preventDefault(); });
@@ -677,9 +782,13 @@ async function boot() {
   cap.sample = sample; cap.downloads = downloads;
   let uid = null; try { uid = user ? await user.id() : null; } catch (e) {}
   try { cap.images = sample ? !!(await sample.limits()).images : false; } catch (e) { cap.images = false; }
+  if (!cap.viewer) {
+    try { cap.key = localStorage.getItem('xp.key') || ''; const m = localStorage.getItem('xp.model'); if (m && MODELS.some(x => x[0] === m)) cap.model = m; } catch (e) {}
+    if ('serviceWorker' in navigator && /^https?:$/.test(location.protocol)) navigator.serviceWorker.register('sw.js').catch(() => {});
+  }
   await store.init({db, uid, assets});
 }
-window.ExpenseApp = {S, cap, store, calc, buildPdf, buildXlsx, sampleReceipt, normalise, nextNumber};
+window.ExpenseApp = {S, cap, store, calc, buildPdf, buildXlsx, buildBackup, sampleReceipt, normalise, nextNumber};
 boot();
 }
 </script>

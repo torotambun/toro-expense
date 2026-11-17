@@ -294,19 +294,104 @@ def run():
         check("rounding, date order and an all-alcohol receipt", u["c"] == [18.71, ["6220:8.7", "6130:10.01"], "JPY"], u["c"])
         ctx.close()
 
-        # ---------- B. outside Claude: local storage, plain download ----------
-        ctx = br.new_context(viewport={"width": 1100, "height": 800}, accept_downloads=True)
-        ctx.route("**/fonts.googleapis.com/**", lambda r: r.abort())
+        # ---------- B. installed version, outside Claude: on-device storage, own API key ----------
+        KEY = "sk-ant-test-0123456789abcdef"; api = {"calls": [], "status": 200}
+
+        def anthropic(route):
+            rq = route.request; cors = {"access-control-allow-origin": "*", "access-control-allow-headers": "*", "access-control-allow-methods": "POST, OPTIONS"}
+            if rq.method == "OPTIONS":
+                return route.fulfill(status=204, headers=cors)
+            body = json.loads(rq.post_data or "{}"); api["calls"].append({"h": rq.headers, "b": body})
+            if api["status"] != 200:
+                return route.fulfill(status=api["status"], headers=cors, content_type="application/json", body=json.dumps({"type": "error", "error": {"type": "authentication_error", "message": "invalid x-api-key"}}))
+            route.fulfill(status=200, headers=cors, content_type="application/json", body=json.dumps({"content": [{"type": "text", "text": "Here is the result.\n```json\n" + json.dumps(REPLY) + "\n```"}]}))
+
+        ctx = br.new_context(viewport={"width": 390, "height": 844}, device_scale_factor=2, accept_downloads=True, service_workers="block")
+        ctx.route("**/fonts.googleapis.com/**", lambda r: r.abort()); ctx.route("https://api.anthropic.com/**", anthropic)
+        ctx.add_init_script("navigator.canShare = d => !!(d && d.files && d.files.length); navigator.share = async d => { window.__shared = d.files[0].name + '|' + d.files[0].size; };")
         page = ctx.new_page(); page.on("pageerror", lambda e: errors.append("pageerror(B): " + str(e)))
+        page.on("console", lambda m: errors.append("B: " + m.text) if m.type == "error" and "ERR_FAILED" not in m.text and "401" not in m.text else None)
         page.goto(url); page.wait_for_selector("text=No reports yet")
-        check("without Claude the page falls back to browser storage and says so", page.evaluate("ExpenseApp.store.mode") == "local" and "this browser only" in text(page))
-        new_report(page, "AEI", "Local test"); manual(page, "Stationer", "%d-11-03" % YEAR, "SGD", 12.3, "6300")
-        check("receipt reading is reported as unavailable", "not available in this view" in text(page))
+        check("installed version stores on the device and says so", page.evaluate("[ExpenseApp.store.mode, ExpenseApp.store.idb]") == ["local", True] and "on this device only" in text(page))
+        new_report(page, "AEI", "Local test")
+        check("without a key, the report says where the key is added", "API key, which is added under Setup" in text(page))
+        page.set_input_files("#lib", os.path.join(OUT, "receipt.jpg")); page.wait_for_selector("#sheet .note.bad")
+        check("photo without a key: message, no API call, fields open", "API key" in page.inner_text("#sheet .note.bad") and not api["calls"] and not page.is_disabled("#f-merchant"))
+        page.fill("#f-merchant", "Stationer"); page.select_option("#f-code", "6300"); page.fill("#f-total", "12.3"); page.click("[data-act=save-rc]"); page.wait_for_selector("#sheet", state="hidden")
+        check("hand-filled receipt keeps its photo on the device", page.evaluate("ExpenseApp.S.reports[ExpenseApp.S.curId].receipts[0].img.startsWith('l:')"))
+
+        page.click("#nav-setup"); page.wait_for_selector("#k-key")
+        page.fill("#k-key", "not-a-key"); page.click("[data-act=save-key]")
+        check("a malformed key is refused", "does not look like" in page.inner_text("#toast") and page.evaluate("localStorage.getItem('xp.key')") is None)
+        page.fill("#k-key", KEY); page.select_option("#k-model", "claude-haiku-5-5"); page.click("[data-act=save-key]"); page.wait_for_function("document.querySelector('#toast').textContent.includes('saved on this device')")
+        check("key and model are saved on the device and the key is not shown again", page.evaluate("[localStorage.getItem('xp.key'), localStorage.getItem('xp.model')]") == [KEY, "claude-haiku-5-5"] and page.input_value("#k-key") == "" and KEY not in page.content())
+        page.reload(); page.wait_for_selector("#k-key")
+        check("after a restart the key is still in place", "through the saved API key" in text(page) and page.evaluate("ExpenseApp.cap.model") == "claude-haiku-5-5")
+
+        page.click("#nav-reports"); page.click("button.rep >> nth=0"); page.wait_for_selector("h1.num")
+        page.set_input_files("#lib", os.path.join(OUT, "receipt.jpg"))
+        page.wait_for_function("document.querySelector('#f-merchant') && document.querySelector('#f-merchant').value === 'Harbour Lane Kitchen'")
+        c = api["calls"][-1]; img = c["b"]["messages"][0]["content"][0]
+        check("API request: key header, browser-access header, version, model", c["h"].get("x-api-key") == KEY and c["h"].get("anthropic-dangerous-direct-browser-access") == "true" and c["h"].get("anthropic-version") == "2023-06-01" and c["b"]["model"] == "claude-haiku-5-5", {k: v for k, v in c["h"].items() if k.startswith("anthropic")})
+        check("API request carries the photo as a JPEG and the reading prompt", img["type"] == "image" and img["source"]["media_type"] == "image/jpeg" and base64.b64decode(img["source"]["data"])[:2] == b"\xff\xd8" and "6200 Entertainment: Client" in c["b"]["messages"][0]["content"][1]["text"])
+        check("reply wrapped in prose and a code fence is still parsed", page.input_value("#f-total") == "151.07" and page.input_value("#f-alc") == "57.55")
+        page.click("#f-quick button[data-code='6200']"); page.click("[data-act=save-rc]"); page.wait_for_selector("#sheet", state="hidden")
+        check("standalone report total", "SGD 163.37" in page.inner_text(".total"), page.inner_text(".total"))
+        api["status"] = 401
+        page.set_input_files("#lib", os.path.join(OUT, "receipt.jpg")); page.wait_for_selector("[data-act=retry-read]")
+        check("a rejected key gives a clear message", "key was not accepted" in page.inner_text("#sheet"))
+        api["status"] = 200; page.click("[data-act=close]")
+
+        page.reload(); page.wait_for_selector("h1.num")
+        page.wait_for_function("[...document.querySelectorAll('img.th')].length === 2 && [...document.querySelectorAll('img.th')].every(i => i.naturalWidth > 0)")
+        check("after a restart, reports and both photos come back from the device", "SGD 163.37" in page.inner_text(".total"))
+        page.click("[data-act=pdf]"); page.wait_for_selector("[data-act=share-file]")
+        check("export opens a file-ready step with share and download", "AEI-%d-0001.pdf" % YEAR in page.inner_text("#sheet"))
+        page.click("[data-act=share-file]"); page.wait_for_function("window.__shared")
+        check("share hands over the PDF file", page.evaluate("window.__shared").startswith("AEI-%d-0001.pdf|" % YEAR))
         with page.expect_download() as dl:
-            page.click("[data-act=xlsx]")
-        check("plain download works outside Claude", dl.value.suggested_filename == "AEI-%d-0001.xlsx" % YEAR)
-        page.reload(); page.wait_for_selector("ul.list"); check("local data survives a reload", "SGD 12.30" in text(page))
-        ctx.close(); br.close()
+            page.click("#sheet a[download]")
+        pth = os.path.join(OUT, "standalone.pdf"); dl.value.save_as(pth); rd = pypdf.PdfReader(pth)
+        check("downloaded PDF has both receipt photos", len(rd.pages) == 3 and all(len(list(rd.pages[i].images)) == 1 for i in (1, 2)), len(rd.pages))
+        page.click("[data-act=close]")
+
+        # backup, wipe, restore
+        page.click("#nav-setup"); page.wait_for_selector("[data-act=backup]"); page.click("[data-act=backup]"); page.wait_for_selector("#sheet a[download]")
+        with page.expect_download() as dl:
+            page.click("#sheet a[download]")
+        bpath = os.path.join(OUT, dl.value.suggested_filename); dl.value.save_as(bpath); bk = json.load(open(bpath))
+        check("backup file holds setup, the report and both photos, and no key", bk["app"] == "expense-reports" and len(bk["reports"]) == 1 and len(bk["images"]) == 2 and KEY not in open(bpath).read(), [len(bk["reports"]), len(bk["images"])])
+        page.click("[data-act=close]"); page.click("#nav-reports"); page.click("button.rep >> nth=0"); page.wait_for_selector("h1.num")
+        page.click("[data-act=del-report]"); page.click("[data-act=del-report]"); page.wait_for_selector("text=No reports yet")
+        page.reload(); page.wait_for_selector("text=No reports yet")
+        page.click("#nav-setup"); page.wait_for_selector("label[for=restore]"); page.set_input_files("#restore", bpath); page.wait_for_selector("[data-act=do-restore]")
+        check("restore asks before replacing and names what the file holds", "1 report" in page.inner_text("#sheet") and "2 receipt photos" in page.inner_text("#sheet"))
+        page.click("[data-act=do-restore]"); page.wait_for_selector("ul.list"); page.reload(); page.wait_for_selector("ul.list")
+        page.click("button.rep >> nth=0"); page.wait_for_selector("h1.num")
+        page.wait_for_function("[...document.querySelectorAll('img.th')].length === 2 && [...document.querySelectorAll('img.th')].every(i => i.naturalWidth > 0)")
+        check("restored report shows its total and photos after a restart", "SGD 163.37" in page.inner_text(".total"))
+        page.set_input_files("#restore", os.path.join(OUT, "receipt.jpg")); page.wait_for_function("document.querySelector('#toast').textContent.includes('not a backup')")
+        check("a wrong file is refused as a backup", True)
+
+        page.click("#nav-setup"); page.wait_for_selector("[data-act=selftest]"); page.click("[data-act=selftest]")
+        page.wait_for_function("document.querySelectorAll('#selftest table').length === 2", timeout=30000); st = page.inner_text("#selftest")
+        check("self check in the installed version: 12 correct", st.count("Correct") == 12 and "Failed" not in st and "Differs" not in st, st)
+        page.screenshot(path=os.path.join(OUT, "07-standalone-setup.png"), full_page=True)
+        page.click("[data-act=del-key]"); page.click("[data-act=del-key]")
+        check("the key can be removed from the device", page.evaluate("[localStorage.getItem('xp.key'), ExpenseApp.cap.key]") == [None, ""])
+        check("no sideways scroll at 390px on standalone setup", page.evaluate("document.documentElement.scrollWidth <= window.innerWidth"))
+        ctx.close()
+
+        # ---------- C. install files and offline start ----------
+        ctx = br.new_context(viewport={"width": 390, "height": 844}); ctx.route("**/fonts.googleapis.com/**", lambda r: r.abort())
+        page = ctx.new_page(); page.goto(url); page.wait_for_selector("text=No reports yet")
+        man = page.evaluate("fetch('manifest.webmanifest').then(r => r.json())")
+        check("manifest: standalone display, relative start, icons present", man["display"] == "standalone" and man["start_url"] == "./" and all(page.evaluate("u => fetch(u).then(r => r.ok)", i["src"]) for i in man["icons"]) and page.evaluate("fetch('icons/icon-180.png').then(r => r.ok)"))
+        page.evaluate("navigator.serviceWorker.ready.then(() => true)"); page.wait_for_timeout(1200)
+        check("offline cache holds the app shell", page.evaluate("caches.keys().then(async ks => { const c = await caches.open(ks[0]); return (await c.keys()).length >= 6; })"))
+        ctx.set_offline(True); page.reload(); page.wait_for_selector("text=No reports yet")
+        check("the app starts without a network connection, libraries included", page.evaluate("!!(window.jspdf && window.XLSX)"))
+        ctx.set_offline(False); ctx.close(); br.close()
 
     check("no script errors in the browser console", not errors, errors[:5])
     bad = [r for r in results if not r[1]]

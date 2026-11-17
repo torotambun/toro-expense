@@ -12,15 +12,25 @@ A single-page expense report app that runs as a private Claude artifact and is u
 - Expense codes are a general travel and entertainment chart, editable under Setup. They are not an official standard.
 - Export: a PDF with the receipt photos attached, and an Excel file of the line items.
 
+## Two ways to run it
+
+1. **Inside Claude**, as a private artifact. Claude supplies receipt reading, storage and sync across devices.
+2. **Installed from GitHub Pages**, added to the iPhone Home Screen from Safari. No Claude login. Receipt reading uses an Anthropic API key entered under Setup, and all data stays on the device.
+
+The same `index.html` serves both. It detects Claude's artifact runtime and otherwise switches to the installed behaviour.
+
 ## Files
 
 - `index.html`: the whole app (markup, styles, script).
 - `lib/`: jsPDF 2.5.1, jspdf-autotable 3.8.2 and SheetJS 0.18.5 (mini build), served with the page.
-- `tests/test_app.py`: end-to-end test in a headless browser, with stand-ins for the Claude capabilities.
+- `manifest.webmanifest`, `icons/`, `sw.js`: Home Screen install and offline start for the installed version.
+- `tests/test_app.py`: end-to-end test in a headless browser, with stand-ins for the Claude capabilities and for the Anthropic API.
 
 ## Where the data lives
 
-Inside Claude the page uses the artifact capabilities `db` (reports and setup, in the viewer's private area), `assets` (receipt photos), `sample` with images (receipt reading) and `downloads` (export files). Nothing is stored in this repository. Opened outside Claude, the page falls back to the browser's local storage and has no receipt reading.
+Inside Claude the page uses the artifact capabilities `db` (reports and setup, in the viewer's private area), `assets` (receipt photos), `sample` with images (receipt reading) and `downloads` (export files).
+
+In the installed version, reports, setup and receipt photos are kept in the browser's IndexedDB on the device. The API key is kept in the browser's local storage on the device and is sent only to `api.anthropic.com`. Nothing is stored in this repository or on GitHub. Because the data exists only on the device, Setup offers a backup file (setup, reports and photos, without the key) that can be saved to iCloud Drive and restored later.
 
 ## Test
 
