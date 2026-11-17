@@ -143,6 +143,13 @@ const money = (n, c) => c + ' ' + fmt(n, c);
 const num = x => { if (typeof x === 'number') return isFinite(x) ? x : 0; const v = parseFloat(String(x ?? '').replace(/[^0-9.\-]/g, '')); return isFinite(v) ? v : 0; };
 /* amounts as the model returns them: tolerates "125.000", "1,234.50" and "1.234,50" when a string slips through */
 const amt = x => { if (typeof x === 'number') return isFinite(x) ? x : 0; let s = String(x ?? '').replace(/[^0-9.,\-]/g, ''); if (/^-?\d{1,3}([.,]\d{3})+$/.test(s)) s = s.replace(/[.,]/g, ''); else { const i = Math.max(s.lastIndexOf('.'), s.lastIndexOf(',')); if (i >= 0) s = s.slice(0, i).replace(/[.,]/g, '') + '.' + s.slice(i + 1); } const v = parseFloat(s); return isFinite(v) ? v : 0; };
+/* a rate is typed in the usual market form "1 STRONG = x WEAK"; this list only picks the default direction, the person can switch it */
+const SMALL = new Set(['IDR', 'VND', 'KRW', 'JPY', 'PHP', 'THB', 'INR', 'TWD', 'LKR', 'KHR', 'LAK', 'MMK', 'CNY', 'HKD', 'MYR', 'AED']);
+const defDir = (c, base) => SMALL.has(c) && !SMALL.has(base) ? 'div' : 'mul';
+const fmtRate = n => (+n || 0).toLocaleString('en-SG', {maximumSignificantDigits: 8});
+/* converts a receipt amount into the report currency; 'div' means the rate was typed as "1 report currency = x receipt currency" */
+const conv = (o, rc, base) => rc.currency === base ? o : rc.rateDir === 'div' && +rc.rateIn > 0 ? o / rc.rateIn : o * (+rc.rate || 0);
+const rateLabel = (rc, base) => rc.rateDir === 'div' ? '1 ' + base + ' = ' + fmtRate(rc.rateIn) + ' ' + rc.currency : '1 ' + rc.currency + ' = ' + fmtRate(rc.rateIn || rc.rate) + ' ' + base;
 const CURS = ['SGD', 'IDR', 'USD', 'MYR', 'EUR', 'GBP', 'JPY', 'AUD', 'HKD', 'THB', 'CNY', 'KRW', 'VND', 'AED'];
 
 const STD_CODES = [
@@ -190,7 +197,7 @@ const allImgs = rc => [rc.img, ...(rc.more || [])].filter(Boolean);
 const recent = () => Object.values(S.reports).sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''));
 const lastPerson = entId => { const r = recent().find(x => x.entityId === entId); return r ? {name: r.name, institution: r.institution, position: r.position} : {}; };
 const projectList = () => [...new Set(recent().map(r => r.project).filter(Boolean))].slice(0, 12);
-const lastRate = (c, base) => { for (const r of Object.values(S.reports).sort((a, b) => (b.updatedAt || '').localeCompare(a.updatedAt || ''))) if (r.currency === base) for (const rc of (r.receipts || []).slice().reverse()) if (rc.currency === c && +rc.rate > 0) return +rc.rate; return 0; };
+const lastRate = (c, base) => { for (const r of Object.values(S.reports).sort((a, b) => (b.updatedAt || '').localeCompare(a.updatedAt || ''))) if (r.currency === base) for (const rc of (r.receipts || []).slice().reverse()) if (rc.currency === c && +rc.rate > 0) return rc.rateDir ? {dir: rc.rateDir, val: +rc.rateIn} : {dir: 'mul', val: +rc.rate}; return null; };
 
 /* ---------- storage: Claude storage when available, this browser otherwise ---------- */
 const idb = {
@@ -337,7 +344,7 @@ function calc(r) {
     const same = rc.currency === r.currency, rate = same ? 1 : (+rc.rate || 0);
     if (!rate) missing++;
     const tot = rnd(rc.total, rc.currency), alc = Math.min(Math.max(rnd(rc.alcohol || 0, rc.currency), 0), tot), main = rnd(tot - alc, rc.currency);
-    const add = (code, orig, kind) => { const base = rnd(orig * rate, r.currency); rows.push({n: i + 1, rc, code, orig, base, kind, rate}); total = rnd(total + base, r.currency); by[code] = rnd((by[code] || 0) + base, r.currency); };
+    const add = (code, orig, kind) => { const base = rnd(conv(orig, rc, r.currency), r.currency); rows.push({n: i + 1, rc, code, orig, base, kind, rate}); total = rnd(total + base, r.currency); by[code] = rnd((by[code] || 0) + base, r.currency); };
     if (main > 0 || !alc) add(rc.code, main, 'main');
     if (alc > 0) add(alcCode(), alc, 'alc');
   });
@@ -432,7 +439,7 @@ function sampleReceipt() {
 
 /* ---------- exports ---------- */
 const ps = s => String(s ?? '').normalize('NFKD').replace(/[̀-ͯ]/g, '').replace(/[–—]/g, '-').replace(/[^\x20-\x7E\xA0-\xFF\n]/g, '?');
-const rateTxt = x => x.rate === 1 ? '' : String(+(+x.rate).toPrecision(8));
+const rateTxt = (x, base) => x.rc.currency === base ? '' : x.rc.rateDir === 'div' ? fmtRate(x.rc.rateIn) + '\n' + x.rc.currency + ' per ' + base : fmtRate(x.rc.rateIn || x.rc.rate) + '\n' + base + ' per ' + x.rc.currency;
 async function buildPdf(r) {
   if (!window.jspdf || !window.jspdf.jsPDF) throw new Error('PDF library did not load');
   const doc = new window.jspdf.jsPDF({unit: 'mm', format: 'a4'}), W = 210, M = 14, k = calc(r);
@@ -443,10 +450,10 @@ async function buildPdf(r) {
   const meta = [['Project', r.project], ['Period', fd(r.from) + ' to ' + fd(r.to)], ['Name', r.name], ['Institution', r.institution], ['Position', r.position], ['Report currency', r.currency], ['Status', r.status === 'submitted' ? 'Submitted' : 'Draft']];
   doc.setFontSize(9.5); let y = 30;
   meta.forEach(([a, b]) => { doc.setFont('helvetica', 'normal'); doc.setTextColor(95); doc.text(a, M, y); doc.setTextColor(20); doc.setFont('helvetica', 'bold'); const t = doc.splitTextToSize(ps(b || '-'), W - M - 50); doc.text(t, 50, y); y += 5.2 * t.length; });
-  const body = k.rows.map(x => [String(x.n), fd(x.rc.date), ps(x.rc.merchant) + '\n' + ps(x.kind === 'alc' ? 'Alcohol portion of this receipt' : (x.rc.purpose || '')), x.code + '\n' + ps(label(x.code)), ps(money(x.orig, x.rc.currency)), rateTxt(x), fmt(x.base, r.currency)]);
+  const body = k.rows.map(x => [String(x.n), fd(x.rc.date), ps(x.rc.merchant) + '\n' + ps(x.kind === 'alc' ? 'Alcohol portion of this receipt' : (x.rc.purpose || '')), x.code + '\n' + ps(label(x.code)), ps(money(x.orig, x.rc.currency)), rateTxt(x, r.currency), fmt(x.base, r.currency)]);
   const tbl = {theme: 'plain', styles: {font: 'helvetica', fontSize: 8.5, cellPadding: 1.6, textColor: 20, lineColor: 190, lineWidth: {bottom: 0.1}, overflow: 'linebreak'}, headStyles: {fontStyle: 'bold', textColor: 95, lineColor: 20, lineWidth: {bottom: 0.4}}, footStyles: {fontStyle: 'bold', lineColor: 20, lineWidth: {top: 0.4}}, margin: {left: M, right: M, bottom: 16}};
   doc.autoTable({...tbl, startY: y + 3, head: [['No', 'Date', 'Merchant and description', 'Expense code', 'Receipt amount', 'Rate', 'Amount ' + r.currency]], body, foot: [['', '', '', '', '', 'Total', fmt(k.total, r.currency)]],
-    columnStyles: {0: {cellWidth: 9}, 1: {cellWidth: 22}, 3: {cellWidth: 40}, 4: {cellWidth: 28, halign: 'right'}, 5: {cellWidth: 18, halign: 'right'}, 6: {cellWidth: 26, halign: 'right'}},
+    columnStyles: {0: {cellWidth: 8}, 1: {cellWidth: 21}, 3: {cellWidth: 36}, 4: {cellWidth: 27, halign: 'right'}, 5: {cellWidth: 24, halign: 'right'}, 6: {cellWidth: 25, halign: 'right'}},
     didParseCell: d => { if (d.section !== 'body' && d.column.index >= 4) d.cell.styles.halign = 'right'; }});
   y = doc.lastAutoTable.finalY + 9;
   if (y > 225) { doc.addPage(); y = 20; }
@@ -480,10 +487,10 @@ function buildXlsx(r) {
   if (!window.XLSX) throw new Error('Excel library did not load');
   const X = window.XLSX, k = calc(r);
   const a = [['Expense report'], ['Report number', r.number], ['Entity', r.entityName], ['Project', r.project], ['Period from', r.from], ['Period to', r.to], ['Name', r.name], ['Institution', r.institution], ['Position', r.position], ['Report currency', r.currency], ['Status', r.status === 'submitted' ? 'Submitted' : 'Draft'], [],
-    ['No', 'Date', 'Merchant', 'Description', 'Expense code', 'Category', 'Receipt currency', 'Receipt amount', 'Rate to ' + r.currency, 'Amount ' + r.currency, 'Line type']];
-  k.rows.forEach(x => a.push([x.n, x.rc.date, x.rc.merchant, x.kind === 'alc' ? 'Alcohol portion of this receipt' : (x.rc.purpose || ''), x.code, label(x.code), x.rc.currency, x.orig, x.rate, x.base, x.kind === 'alc' ? 'Alcohol' : 'Expense']));
+    ['No', 'Date', 'Merchant', 'Description', 'Expense code', 'Category', 'Receipt currency', 'Receipt amount', r.currency + ' per 1 unit', 'Amount ' + r.currency, 'Line type', 'Exchange rate as entered']];
+  k.rows.forEach(x => a.push([x.n, x.rc.date, x.rc.merchant, x.kind === 'alc' ? 'Alcohol portion of this receipt' : (x.rc.purpose || ''), x.code, label(x.code), x.rc.currency, x.orig, x.rc.currency === r.currency ? 1 : x.rc.rate, x.base, x.kind === 'alc' ? 'Alcohol' : 'Expense', x.rc.currency === r.currency ? '' : rateLabel(x.rc, r.currency)]));
   a.push(['', '', '', '', '', '', '', '', 'Total', k.total]);
-  const ws = X.utils.aoa_to_sheet(a); ws['!cols'] = [16, 16, 30, 34, 13, 38, 10, 15, 13, 15, 10].map(w => ({wch: w}));
+  const ws = X.utils.aoa_to_sheet(a); ws['!cols'] = [16, 16, 30, 34, 13, 38, 10, 15, 14, 15, 10, 26].map(w => ({wch: w}));
   const b = [['Summary by expense code'], ['Report number', r.number], [], ['Expense code', 'Category', 'Amount ' + r.currency]];
   Object.keys(k.by).sort().forEach(c => b.push([c, label(c), k.by[c]])); b.push(['', 'Total', k.total]);
   const ws2 = X.utils.aoa_to_sheet(b); ws2['!cols'] = [18, 42, 16].map(w => ({wch: w}));
@@ -546,7 +553,7 @@ function viewReport(r) {
   const list = groups.map(g => { const rc = g.rc, main = g.rows.find(x => x.kind === 'main'), alc = g.rows.find(x => x.kind === 'alc'), base = g.rows.reduce((s, x) => s + x.base, 0), needRate = rc.currency !== r.currency && !(+rc.rate > 0);
     return '<li><button class="rc" data-act="edit-rc" data-id="' + esc(rc.id) + '">' + (rc.img ? '<img class="th" alt="" data-ref="' + esc(rc.img) + '">' : '<span class="th none">No photo</span>') +
       '<span class="m">' + esc(rc.merchant || 'Unnamed merchant') + '</span><span class="a num">' + esc(money(rc.total, rc.currency)) + '</span>' +
-      '<span class="sub"><span>' + esc(fd(rc.date)) + (rc.purpose ? ', ' + esc(rc.purpose) : '') + '</span>' + (rc.currency !== r.currency ? '<span class="num">' + (needRate ? '<span class="chip warn">Rate needed</span>' : esc(money(base, r.currency))) + '</span>' : '') + '</span>' +
+      '<span class="sub"><span>' + esc(fd(rc.date)) + (rc.purpose ? ', ' + esc(rc.purpose) : '') + '</span>' + (rc.currency !== r.currency ? '<span class="num">' + (needRate ? '<span class="chip warn">Rate needed</span>' : esc(money(base, r.currency)) + '<br><span class="sm">' + esc(rateLabel(rc, r.currency)) + '</span>') + '</span>' : '') + '</span>' +
       '<span class="sub"><span>' + esc(rc.code) + ' ' + esc(label(rc.code)) + '</span>' + (main && alc ? '<span class="num">' + esc(fmt(main.orig, rc.currency)) + '</span>' : '') + '</span>' +
       (alc ? '<span></span><span class="sub"><span>' + esc(alc.code) + ' ' + esc(label(alc.code)) + '</span><span class="num">' + esc(fmt(alc.orig, rc.currency)) + '</span></span>' : '') + '</button></li>'; }).join('');
   const sum = Object.keys(k.by).sort().map(c => '<tr><td class="num">' + esc(c) + '</td><td>' + esc(label(c)) + '</td><td class="r num">' + esc(fmt(k.by[c], r.currency)) + '</td></tr>').join('');
@@ -615,7 +622,8 @@ function rcSheet() {
     '<label class="f">Expense code<select id="f-code"><option value="">Choose a code</option>' + opts + '</select></label>' +
     (meals.length > 1 ? '<div class="quick" id="f-quick">' + meals.map(c => '<button type="button" data-act="quick" data-code="' + esc(c.code) + '">' + esc(c.label) + '</button>').join('') + '</div>' : '') +
     '<div class="two"><label class="f">Receipt total<input id="f-total" type="number" step="any" min="0" inputmode="decimal" value="' + (rc.total || '') + '"></label><label class="f">Alcohol portion<span class="h">Includes its share of tax and service.</span><input id="f-alc" type="number" step="any" min="0" inputmode="decimal" value="' + (rc.alcohol || '') + '"></label></div>' +
-    '<label class="f" id="f-rate-row">Exchange rate<span class="h" id="f-rate-h"></span><input id="f-rate" type="number" step="any" min="0" inputmode="decimal" value="' + (rc.rate || '') + '"></label>' +
+    '<div id="f-rate-row"><label class="f">Exchange rate written as<select id="f-dir"><option value="div"></option><option value="mul"></option></select></label>' +
+    '<label class="f">Rate<span class="h" id="f-rate-h"></span><input id="f-rate" type="number" step="any" min="0" inputmode="decimal" value="' + (rc.rateIn || rc.rate || '') + '"></label></div>' +
     '<div class="calc" id="f-calc"></div>' +
     (rc.items && rc.items.length ? '<details><summary>Items read from the receipt (' + rc.items.length + ')</summary><ul class="items">' + rc.items.map(i => '<li><span>' + esc(i.d) + (i.alc ? ' <span class="chip warn">Alcohol</span>' : '') + '</span><span class="num">' + esc(fmt(i.a, rc.currency)) + '</span></li>').join('') + '</ul></details>' : '') +
     '<label class="f">Note<textarea id="f-note">' + esc(rc.note) + '</textarea></label></fieldset>' +
@@ -626,14 +634,25 @@ function rcSheet() {
 function pullRc() {
   if (!E || !$('#f-merchant')) return; const rc = E.rc, v = id => $(id).value.trim();
   rc.merchant = v('#f-merchant'); rc.date = v('#f-date'); rc.purpose = v('#f-purpose'); rc.code = v('#f-code'); rc.note = v('#f-note');
-  rc.currency = v('#f-cur').toUpperCase().replace(/[^A-Z]/g, ''); rc.total = rnd(num(v('#f-total')), rc.currency); rc.alcohol = rnd(num(v('#f-alc')), rc.currency); rc.rate = num(v('#f-rate'));
+  rc.currency = v('#f-cur').toUpperCase().replace(/[^A-Z]/g, ''); rc.total = rnd(num(v('#f-total')), rc.currency); rc.alcohol = rnd(num(v('#f-alc')), rc.currency);
+  rc.rateDir = $('#f-dir').value || 'mul'; rc.rateIn = num(v('#f-rate')); rc.rate = rc.rateDir === 'div' ? (rc.rateIn > 0 ? 1 / rc.rateIn : 0) : rc.rateIn;
 }
 function syncRc() {
   if (!E || !$('#f-calc')) return; pullRc(); const r = cur(), rc = E.rc, foreign = rc.currency.length === 3 && rc.currency !== r.currency;
   $('#f-rate-row').hidden = !foreign;
-  if (foreign) { $('#f-rate-h').textContent = 'How many ' + r.currency + ' for 1 ' + rc.currency + '.'; if (!rc.rate && !E.rateTried) { E.rateTried = rc.currency; const k = lastRate(rc.currency, r.currency); if (k) { rc.rate = k; $('#f-rate').value = k; } } else if (E.rateTried && E.rateTried !== rc.currency) E.rateTried = ''; }
+  if (foreign) {
+    const sel = $('#f-dir'); sel.options[0].textContent = '1 ' + r.currency + ' = … ' + rc.currency; sel.options[1].textContent = '1 ' + rc.currency + ' = … ' + r.currency;
+    /* a new currency gets its default direction and the last rate used for it */
+    if (E.dirFor !== rc.currency) {
+      const first = E.dirFor === undefined; E.dirFor = rc.currency;
+      if (!(first && E.rc.rateDir && rc.rateIn)) { const k = lastRate(rc.currency, r.currency); sel.value = k ? k.dir : defDir(rc.currency, r.currency); if (!first || !rc.rateIn) $('#f-rate').value = k ? k.val : ''; }
+      else sel.value = E.rc.rateDir;
+      pullRc();
+    }
+    $('#f-rate-h').textContent = rc.rateIn > 0 ? 'The same rate the other way: ' + (rc.rateDir === 'div' ? '1 ' + rc.currency + ' = ' + fmtRate(1 / rc.rateIn) + ' ' + r.currency : '1 ' + r.currency + ' = ' + fmtRate(1 / rc.rateIn) + ' ' + rc.currency) + '.' : (rc.rateDir === 'div' ? 'How many ' + rc.currency + ' for 1 ' + r.currency + '.' : 'How many ' + r.currency + ' for 1 ' + rc.currency + '.');
+  }
   for (const b of sheet.querySelectorAll('#f-quick button')) b.classList.toggle('on', b.dataset.code === rc.code);
-  const rate = foreign ? rc.rate : 1, alc = Math.min(rc.alcohol, rc.total), main = rnd(rc.total - alc, rc.currency), line = (amt, code) => '<div><b>' + esc(money(rnd(amt * rate, r.currency), r.currency)) + '</b> to ' + esc(code || 'no code yet') + ' ' + esc(label(code)) + '</div>';
+  const rate = foreign ? rc.rate : 1, alc = Math.min(rc.alcohol, rc.total), main = rnd(rc.total - alc, rc.currency), line = (amt, code) => '<div><b>' + esc(money(rnd(conv(amt, rc, r.currency), r.currency), r.currency)) + '</b> to ' + esc(code || 'no code yet') + ' ' + esc(label(code)) + '</div>';
   $('#f-calc').innerHTML = !rc.total ? '<span class="mut">The claim lines appear here once a total is entered.</span>' : foreign && !rate ? '<span class="mut">An exchange rate is needed to convert ' + esc(rc.currency) + ' into ' + esc(r.currency) + '.</span>' : (main > 0 || !alc ? line(main, rc.code) : '') + (alc > 0 ? line(alc, alcCode()) : '');
 }
 async function addFromFile(file) {
@@ -731,7 +750,7 @@ const acts = {
     if (rc.alcohol > rc.total) return err('The alcohol portion cannot be more than the receipt total.');
     if (!rc.code) return err('An expense code is needed.');
     if (rc.currency !== r.currency && !(rc.rate > 0)) return err('An exchange rate from ' + rc.currency + ' to ' + r.currency + ' is needed.');
-    if (rc.currency === r.currency) rc.rate = 0;
+    if (rc.currency === r.currency) { rc.rate = 0; rc.rateIn = 0; delete rc.rateDir; }
     b.disabled = true; b.textContent = 'Saving…';
     if (E.upload) await E.upload;
     const out = clone(rc), i = r.receipts.findIndex(x => x.id === out.id);

@@ -6,7 +6,7 @@ A single-page expense report app that runs as a private Claude artifact and is u
 
 - One report per entity and project, with a period, name, institution and position.
 - Report numbers are assigned automatically per entity and year: `AEI-2026-0001`, `YMM-2026-0001`.
-- Aren Energy Investment Pte. Ltd. reports total in SGD. Yayasan Mens et Manus reports total in IDR. Receipts in another currency keep their original amount and are converted with an exchange rate entered on the receipt.
+- Aren Energy Investment Pte. Ltd. reports total in SGD. Yayasan Mens et Manus reports total in IDR. Receipts in another currency keep their original amount and are converted with an exchange rate entered on the receipt, typed either as "1 SGD = 11,500 IDR" or as "1 USD = 1.35 SGD".
 - A receipt is added by photo, screenshot or PDF (the first 3 pages are used). Claude reads the merchant, date, currency, total, line items and a suggested expense code. Every field stays editable before saving.
 - Alcohol on an itemised receipt is split out, with its share of tax and service charge, and booked to its own expense code (6220 by default).
 - Expense codes are a general travel and entertainment chart, editable under Setup. They are not an official standard.
