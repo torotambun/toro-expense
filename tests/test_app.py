@@ -67,6 +67,17 @@ def make_receipt(path):
     b = io.BytesIO(); im.save(b, "JPEG", quality=70); return b.getvalue()
 
 
+def make_pdf(path):
+    pages = []
+    for n in (1, 2):
+        im = Image.new("RGB", (1240, 1754), "white"); d = ImageDraw.Draw(im)
+        d.text((100, 100), "TAX INVOICE  page %d of 2" % n, fill="black")
+        for i in range(12):
+            d.text((100, 220 + i * 90), ("Line item %d" % (i + 1)) if n == 1 else ("Total due SGD 151.07" if i == 11 else "Terms %d" % i), fill="black")
+        pages.append(im)
+    pages[0].save(path, "PDF", save_all=True, append_images=pages[1:], resolution=150)
+
+
 def serve():
     h = functools.partial(http.server.SimpleHTTPRequestHandler, directory=ROOT)
     http.server.SimpleHTTPRequestHandler.log_message = lambda *a, **k: None
@@ -105,6 +116,7 @@ def manual(page, merchant, date, cur, total, code, rate=None, alc=None, purpose=
 
 def run():
     serve(); img_bytes = make_receipt(os.path.join(OUT, "receipt.jpg")); errors = []
+    make_pdf(os.path.join(OUT, "invoice.pdf")); open(os.path.join(OUT, "broken.pdf"), "wb").write(b"%PDF-1.4 this is not really a pdf")
     with sync_playwright() as pw:
         br = pw.chromium.launch(executable_path="/usr/bin/google-chrome", args=["--no-sandbox"])
 
@@ -283,6 +295,31 @@ def run():
         check("dark theme uses the night background", bg in ("rgb(16, 25, 30)",), bg)
         check("every stored write went under the viewer's private path", page.evaluate("(window.__writes || []).every(p => p.startsWith('data/users/u_test/'))"))
 
+        # PDF receipt: two pages read together, stored, attached
+        page.goto(url + "#reports"); page.wait_for_selector("ul.list")
+        n6 = new_report(page, "AEI", "PDF receipts"); page.evaluate("window.__up = []; window.__del = []")
+        page.set_input_files("#doc", os.path.join(OUT, "invoice.pdf"))
+        page.wait_for_function("document.querySelector('#f-merchant') && document.querySelector('#f-merchant').value === 'Harbour Lane Kitchen'", timeout=30000)
+        check("a 2-page PDF is sent to the reader as 2 page images", page.evaluate("window.__imgs") == 2, page.evaluate("window.__imgs"))
+        check("the first page is shown as the preview", page.evaluate("document.querySelector('#sheet img.shot').naturalWidth > 500"))
+        page.click("#f-quick button[data-code='6200']"); page.click("[data-act=save-rc]"); page.wait_for_selector("#sheet", state="hidden")
+        check("both pages are stored with the receipt", page.evaluate("(r => [r.img.startsWith('a:'), (r.more || []).length])(ExpenseApp.S.reports[ExpenseApp.S.curId].receipts[0])") == [True, 1] and page.evaluate("window.__up.length") == 2)
+        page.click("button.rc >> nth=0"); check("the receipt notes that 2 pages are stored", "2 pages are stored" in page.inner_text("#sheet")); page.click("[data-act=close]")
+        page.click("[data-act=pdf]"); page.wait_for_function("(window.__saved || {})['%s.pdf']" % n6, timeout=30000)
+        rd = pypdf.PdfReader(io.BytesIO(saved(page, n6 + ".pdf"))); t = "\n".join(p.extract_text() for p in rd.pages)
+        open(os.path.join(OUT, "pdfreceipt.pdf"), "wb").write(saved(page, n6 + ".pdf"))
+        check("report PDF attaches both pages, each labelled", len(rd.pages) == 3 and len({len(im.data) for im in rd.pages[1].images}) == 2 and "(page 1 of 2)" in t and "(page 2 of 2)" in t, len(rd.pages))
+        bk = page.evaluate("ExpenseApp.buildBackup().then(b => b.text()).then(t => Object.keys(JSON.parse(t).images).length)")
+        check("backup includes the extra page", bk == 3, bk)
+        page.click("button.rc >> nth=0"); page.click("[data-act=del-rc]"); page.click("[data-act=del-rc]"); page.wait_for_selector("#sheet", state="hidden")
+        check("deleting the receipt removes both stored pages", page.evaluate("window.__del.length") == 2)
+        page.set_input_files("#doc", os.path.join(OUT, "broken.pdf")); page.wait_for_selector("#sheet .note.bad")
+        check("a damaged PDF gives a clear message", "could not be opened" in page.inner_text("#sheet .note.bad")); page.click("[data-act=close]")
+        page.set_input_files("#doc", os.path.join(OUT, "receipt.jpg"))
+        page.wait_for_function("document.querySelector('#f-merchant') && document.querySelector('#f-merchant').value === 'Harbour Lane Kitchen'")
+        check("the file button also takes an ordinary photo", page.evaluate("window.__imgs") == 1); page.click("[data-act=close]")
+        page.click("[data-act=del-report]"); page.click("[data-act=del-report]"); page.wait_for_selector("ul.list")
+
         # arithmetic unit checks through the page's own functions
         u = page.evaluate("""(() => { const A = ExpenseApp, r = {currency: 'IDR', project: ''};
           const a = A.normalise({merchant: 'Warung', currency: 'IDR', total: '1.250.000', subtotal: '1.000.000', code: '6130', items: [{d: 'Bintang', a: '200.000', alc: true}, {d: 'Nasi', a: '800.000'}]}, r);
@@ -341,6 +378,11 @@ def run():
         page.set_input_files("#lib", os.path.join(OUT, "receipt.jpg")); page.wait_for_selector("[data-act=retry-read]")
         check("a rejected key gives a clear message", "key was not accepted" in page.inner_text("#sheet"))
         api["status"] = 200; page.click("[data-act=close]")
+        page.set_input_files("#doc", os.path.join(OUT, "invoice.pdf"))
+        page.wait_for_function("document.querySelector('#f-merchant') && document.querySelector('#f-merchant').value === 'Harbour Lane Kitchen'", timeout=30000)
+        blocks = api["calls"][-1]["b"]["messages"][0]["content"]
+        check("installed version: a 2-page PDF goes to the API as 2 images plus the prompt", [b["type"] for b in blocks] == ["image", "image", "text"], [b["type"] for b in blocks])
+        page.click("[data-act=close]")
 
         page.reload(); page.wait_for_selector("h1.num")
         page.wait_for_function("[...document.querySelectorAll('img.th')].length === 2 && [...document.querySelectorAll('img.th')].every(i => i.naturalWidth > 0)")
@@ -388,7 +430,7 @@ def run():
         man = page.evaluate("fetch('manifest.webmanifest').then(r => r.json())")
         check("manifest: standalone display, relative start, icons present", man["display"] == "standalone" and man["start_url"] == "./" and all(page.evaluate("u => fetch(u).then(r => r.ok)", i["src"]) for i in man["icons"]) and page.evaluate("fetch('icons/icon-180.png').then(r => r.ok)"))
         page.evaluate("navigator.serviceWorker.ready.then(() => true)"); page.wait_for_timeout(1200)
-        check("offline cache holds the app shell", page.evaluate("caches.keys().then(async ks => { const c = await caches.open(ks[0]); return (await c.keys()).length >= 6; })"))
+        check("offline cache holds the app shell, PDF reader included", page.evaluate("caches.keys().then(async ks => { const c = await caches.open(ks[0]); const k = (await c.keys()).map(r => r.url); return k.length >= 8 && k.some(u => u.endsWith('pdf.worker.min.js')); })"))
         ctx.set_offline(True); page.reload(); page.wait_for_selector("text=No reports yet")
         check("the app starts without a network connection, libraries included", page.evaluate("!!(window.jspdf && window.XLSX)"))
         ctx.set_offline(False); ctx.close(); br.close()
