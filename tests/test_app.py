@@ -299,6 +299,14 @@ def run():
         page.goto(url + "#setup"); page.reload(); page.wait_for_selector("#setup-form")
         codes = page.evaluate("ExpenseApp.S.settings.codes.map(c => c.code + '|' + c.label + '|' + (c.alcohol || 0) + '|' + (c.meal || 0))")
         check("chart edits persist: renamed, added, alcohol and meal marks kept", "6100|Travel: Flights|0|0" in codes and "6950|Site visit costs|0|0" in codes and "6220|Entertainment: Alcohol|1|0" in codes and "6200|Entertainment: Client|0|1" in codes, codes)
+        nx = page.locator("#ents [name=enext] >> nth=0")
+        check("setup shows the next Aren Energy number", nx.input_value() == "3" and "AEI-%d-0003" % YEAR in page.inner_text("#ents"), nx.input_value())
+        nx.fill("2"); page.click("[data-act=save-setup]")
+        check("a next number already used is refused", "already exists" in page.inner_text("#toast") and "3 or higher" in page.inner_text("#toast"), page.inner_text("#toast"))
+        nx.fill("7"); page.click("[data-act=save-setup]"); page.wait_for_function("document.querySelector('#toast').textContent.includes('Setup saved')")
+        page.reload(); page.wait_for_selector("#setup-form")
+        check("the next number is kept after a restart", page.locator("#ents [name=enext] >> nth=0").input_value() == "7")
+
         page.click("[data-act=selftest]"); page.wait_for_function("document.querySelectorAll('#selftest table').length === 2", timeout=30000)
         st = page.inner_text("#selftest")
         check("self check: reading correct on 7 fields, storage and export correct on 5 steps", st.count("Correct") == 12 and "Differs" not in st and "Failed" not in st, st)
@@ -320,6 +328,7 @@ def run():
         # PDF receipt: two pages read together, stored, attached
         page.goto(url + "#reports"); page.wait_for_selector("ul.list")
         n6 = new_report(page, "AEI", "PDF receipts"); page.evaluate("window.__up = []; window.__del = []")
+        check("the next report continues at the number set by hand", n6 == "AEI-%d-0007" % YEAR, n6)
         page.set_input_files("#doc", os.path.join(OUT, "invoice.pdf"))
         page.wait_for_function("document.querySelector('#f-merchant') && document.querySelector('#f-merchant').value === 'Harbour Lane Kitchen'", timeout=30000)
         check("a 2-page PDF is sent to the reader as 2 page images", page.evaluate("window.__imgs") == 2, page.evaluate("window.__imgs"))
