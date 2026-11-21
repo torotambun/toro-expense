@@ -54,7 +54,12 @@ main{padding:24px 0 72px}
 .rep .no{font-weight:700}
 .rep .amt{font:600 18px/1.2 inherit;font-variant-numeric:tabular-nums;text-align:right;white-space:nowrap}
 .chip{display:inline-block;padding:1px 8px;border-radius:99px;font-size:13px;font-weight:600;background:var(--panel);color:var(--ink);white-space:nowrap}
-.chip.ok{color:var(--ok)}.chip.warn{color:var(--warn)}
+.chip.ok{color:var(--ok)}.chip.warn{color:var(--warn)}.chip.bad{color:var(--red);border-color:var(--red)}
+.dup{padding:12px;border:2px solid var(--red);border-radius:8px;margin:12px 0}.dup ul{margin:6px 0 10px;padding-left:20px}
+.mv{padding:12px;border:1px solid var(--line);border-radius:8px;margin:12px 0}.mv h3{margin:0 0 8px}
+.dash{border:1px solid var(--line);border-radius:8px;padding:10px 12px;margin:0 0 18px}.dash summary{display:flex;justify-content:space-between;gap:12px;cursor:pointer;font-weight:600}.dash table{margin:6px 0}.dash h3{margin:14px 0 6px;font-size:15px}
+.three{display:grid;grid-template-columns:1fr 1fr 1.3fr;gap:8px}.togs{display:grid;gap:6px}.tog{display:flex;justify-content:space-between;align-items:center;gap:10px;font-size:15px}.tog select{max-width:150px}
+.rep.pool{border-left:4px solid var(--slate)}
 .empty{padding:36px 0;border-top:2px solid var(--ink);border-bottom:1px solid var(--line)}
 .total{display:flex;justify-content:space-between;align-items:baseline;gap:12px;flex-wrap:wrap;padding:16px;margin:18px 0;background:var(--panel);border-radius:6px}
 .total b{font:600 clamp(28px,8vw,40px)/1.05 "Source Serif 4",Georgia,serif;font-variant-numeric:tabular-nums;white-space:nowrap}
@@ -169,20 +174,46 @@ const LINKS = {
 const linkHtml = keys => '<div class="links">' + keys.map(k => '<a href="' + LINKS[k][1] + '" target="_blank" rel="noopener">' + LINKS[k][0] + '</a>').join('') + '</div>';
 const SOURCES = ['BCA', 'Citibank Singapore', 'Bank Indonesia', 'Other'];
 /* description: what was bought (naming the merchant), then the client and its people; a hand-written override replaces it */
-function autoDesc(rc) {
+function autoDesc(rc, r) {
   const what = (rc.purpose || '').trim(), m = (rc.merchant || '').trim(), first = m.toLowerCase().split(/[ ,]+/)[0] || '';
   let d = what && m && first && !what.toLowerCase().includes(first) ? what + ', ' + m : what || m;
-  const c = (rc.client || '').trim(), a = (rc.attendees || '').trim();
+  const c = clientOf(rc, r), a = (rc.attendees || '').trim();
   if (c && a) d += ' with ' + c + ': ' + a; else if (c) d += ' with ' + c; else if (a) d += ' with ' + a;
   return d;
 }
-const descOf = rc => (rc.descOverride || '').trim() || autoDesc(rc);
+const descOf = (rc, r) => (rc.descOverride || '').trim() || autoDesc(rc, r);
+/* the client belongs to the report; a client typed on a receipt before this rule only shows when the report names none */
+const clientOf = (rc, r) => ((r && r.client) || rc.client || '').trim();
 const cardNote = rc => rc.card && rc.card.original && rc.card.charged ? (rc.card.kind === 'bank' ? 'Bank: ' : 'Card: ') + money(rc.card.original.amount, rc.card.original.currency) + ' = ' + money(rc.card.charged.amount, rc.card.charged.currency) : rc.card ? (rc.card.kind === 'bank' ? 'Bank line' : 'Card line') : '';
 /* a date without a year gets the latest year that keeps it on or before today */
 const latestPast = mmdd => { const m = /^(\d{2})-(\d{2})$/.exec(mmdd || ''); if (!m) return ''; const t = today(), y = +t.slice(0, 4); return (m[1] + '-' + m[2] <= t.slice(5) ? y : y - 1) + '-' + m[1] + '-' + m[2]; };
 const payOf = (r, total) => r.pay && r.pay.currency && r.pay.currency !== r.currency && +r.pay.rate > 0 ? {...r.pay, amount: rnd(conv(total, {currency: r.currency, rateDir: r.pay.rateDir, rateIn: r.pay.rateIn, rate: r.pay.rate}, r.pay.currency), r.pay.currency), label: rateLabel({currency: r.currency, rateDir: r.pay.rateDir, rateIn: r.pay.rateIn, rate: r.pay.rate}, r.pay.currency)} : null;
 const payText = (p, total, claimCur) => 'Total ' + money(total, claimCur) + ' = ' + money(p.amount, p.currency) + ' at ' + p.label + ' (' + (p.source || 'source not stated') + ' middle rate, ' + fd(p.date) + ')';
-const clientList = () => [...new Set(Object.values(S.reports).flatMap(r => (r.receipts || []).map(rc => (rc.client || '').trim())).filter(Boolean))].slice(0, 30);
+const clientList = () => [...new Set(Object.values(S.reports).flatMap(r => [r.client || '', ...(r.receipts || []).map(rc => rc.client || '')]).map(x => x.trim()).filter(Boolean))].slice(0, 30);
+/* ---------- business development pool: one holding place for receipts with no client or project yet ---------- */
+const POOL = 'POOL';
+const isPool = r => !!r && r.kind === 'pool';
+const pool = () => S.reports[POOL] || null;
+const placeName = r => isPool(r) ? 'the business development pool' : r.number + (r.project ? ' (' + r.project + ')' : '');
+const claimReports = () => Object.values(S.reports).filter(r => !isPool(r));
+/* ---------- duplicates: same merchant (letters and digits only), same date, same currency and amount to the cent ---------- */
+const normM = m => String(m || '').toLowerCase().normalize('NFKD').replace(/[^a-z0-9]/g, '');
+/* a card or bank line carries both amounts, so the same transaction is recognised in an SGD and an IDR report alike */
+const amountsOf = rc => [...new Set([[rc.currency, rc.total], ...(rc.card ? [rc.card.charged, rc.card.original].filter(Boolean).map(x => [x.currency, x.amount]) : [])].filter(x => x[0] && +x[1] > 0).map(x => x[0] + ' ' + (+x[1]).toFixed(dec(x[0]))))].sort();
+const dupKey = rc => normM(rc.merchant) && rc.date && amountsOf(rc).length ? normM(rc.merchant) + '|' + rc.date + '|' + amountsOf(rc).join(',') : '';
+function dupIndex() {
+  const m = new Map();
+  for (const r of Object.values(S.reports)) for (const rc of (r.receipts || [])) { if (!dupKey(rc)) continue; const k = normM(rc.merchant) + '|' + rc.date; if (!m.has(k)) m.set(k, []); m.get(k).push({r, rc}); }
+  return m;
+}
+/* a receipt stays flagged while another receipt shares merchant, date and an amount, until the flag is removed by hand for that pair */
+const okIds = rc => String(rc.dupOk || '').split('~').filter(Boolean);
+const dupOthers = (rc, idx) => {
+  if (!dupKey(rc)) return []; const mine = amountsOf(rc);
+  return ((idx || dupIndex()).get(normM(rc.merchant) + '|' + rc.date) || []).filter(x => x.rc.id !== rc.id && amountsOf(x.rc).some(a => mine.includes(a)) && !(okIds(rc).includes(x.rc.id) && okIds(x.rc).includes(rc.id)));
+};
+const flaggedIn = (r, idx) => (r.receipts || []).filter(rc => dupOthers(rc, idx).length);
+const dupText = (others, here) => others.map(x => x.r.id === here.id ? (isPool(here) ? 'twice in the pool' : 'twice in this report') : 'also in ' + placeName(x.r)).filter((t, i, a) => a.indexOf(t) === i).join('; ');
 const CURS = ['SGD', 'IDR', 'USD', 'MYR', 'EUR', 'GBP', 'JPY', 'AUD', 'HKD', 'THB', 'CNY', 'KRW', 'VND', 'AED'];
 
 const STD_CODES = [
@@ -211,7 +242,7 @@ const DEFAULTS = () => ({
     {id: 'AEI', name: 'Aren Energy Investment Pte. Ltd.', prefix: 'AEI', currency: 'SGD'},
     {id: 'YMM', name: 'Yayasan Mens et Manus', prefix: 'YMM', currency: 'IDR'}
   ],
-  codes: clone(STD_CODES), counters: {}
+  codes: clone(STD_CODES), counters: {}, dash: {cur: 'SGD', rate: '', year: new Date().getFullYear()}
 });
 const merge = d => { const o = DEFAULTS(); for (const k in o) if (d && d[k] != null) o[k] = clone(d[k]); return o; };
 
@@ -494,11 +525,11 @@ async function buildPdf(r) {
   doc.setFontSize(11); doc.text('EXPENSE REPORT', W - M, 14, {align: 'right'}); doc.setFontSize(13); doc.text(ps(r.number), W - M, 20, {align: 'right'});
   doc.setDrawColor(20); doc.setLineWidth(0.5); doc.line(M, 23, W - M, 23);
   const pp = payOf(r, k.total);
-  const meta = [['Project', r.project], ['Period', fd(r.from) + ' to ' + fd(r.to)], ['Name', r.name], ['Institution', r.institution], ['Position', r.position], ['Claim currency', r.currency], ['Status', r.status === 'submitted' ? 'Submitted' + (r.pay && r.pay.date ? ' on ' + fd(r.pay.date) : '') : 'Draft']];
+  const meta = [['Project', r.project], ...(r.client ? [['Client', r.client]] : []), ['Period', fd(r.from) + ' to ' + fd(r.to)], ['Name', r.name], ['Institution', r.institution], ['Position', r.position], ['Claim currency', r.currency], ['Status', r.status === 'submitted' ? 'Submitted' + (r.pay && r.pay.date ? ' on ' + fd(r.pay.date) : '') : 'Draft']];
   if (pp) meta.push(['Payment currency', pp.currency]);
   doc.setFontSize(9.5); let y = 30;
   meta.forEach(([a, b]) => { doc.setFont('helvetica', 'normal'); doc.setTextColor(95); doc.text(a, M, y); doc.setTextColor(20); doc.setFont('helvetica', 'bold'); const t = doc.splitTextToSize(ps(b || '-'), W - M - 50); doc.text(t, 50, y); y += 5.2 * t.length; });
-  const body = k.rows.map(x => [String(x.n), fd(x.rc.date), ps(x.rc.merchant) + '\n' + ps(x.kind === 'alc' ? 'Alcohol portion of this receipt' : descOf(x.rc)) + (x.kind !== 'alc' && x.rc.card ? '\n' + ps(cardNote(x.rc)) : ''), x.code + '\n' + ps(label(x.code)), ps(money(x.orig, x.rc.currency)), rateTxt(x, r.currency), fmt(x.base, r.currency)]);
+  const body = k.rows.map(x => [String(x.n), fd(x.rc.date), ps(x.rc.merchant) + '\n' + ps(x.kind === 'alc' ? 'Alcohol portion of this receipt' : descOf(x.rc, r)) + (x.kind !== 'alc' && x.rc.card ? '\n' + ps(cardNote(x.rc)) : ''), x.code + '\n' + ps(label(x.code)), ps(money(x.orig, x.rc.currency)), rateTxt(x, r.currency), fmt(x.base, r.currency)]);
   const tbl = {theme: 'plain', styles: {font: 'helvetica', fontSize: 8.5, cellPadding: 1.6, textColor: 20, lineColor: 190, lineWidth: {bottom: 0.1}, overflow: 'linebreak'}, headStyles: {fontStyle: 'bold', textColor: 95, lineColor: 20, lineWidth: {bottom: 0.4}}, footStyles: {fontStyle: 'bold', lineColor: 20, lineWidth: {top: 0.4}}, margin: {left: M, right: M, bottom: 16}};
   doc.autoTable({...tbl, startY: y + 3, head: [['No', 'Date', 'Merchant and description', 'Expense code', 'Receipt amount', 'Rate', 'Amount ' + r.currency]], body, foot: [['', '', '', '', '', 'Total', fmt(k.total, r.currency)]],
     columnStyles: {0: {cellWidth: 8}, 1: {cellWidth: 21}, 3: {cellWidth: 36}, 4: {cellWidth: 27, halign: 'right'}, 5: {cellWidth: 24, halign: 'right'}, 6: {cellWidth: 25, halign: 'right'}},
@@ -541,9 +572,9 @@ async function buildPdf(r) {
 function buildXlsx(r) {
   if (!window.XLSX) throw new Error('Excel library did not load');
   const X = window.XLSX, k = calc(r);
-  const a = [['Expense report'], ['Report number', r.number], ['Entity', r.entityName], ['Project', r.project], ['Period from', r.from], ['Period to', r.to], ['Name', r.name], ['Institution', r.institution], ['Position', r.position], ['Claim currency', r.currency], ['Status', r.status === 'submitted' ? 'Submitted' : 'Draft'], [],
+  const a = [['Expense report'], ['Report number', r.number], ['Entity', r.entityName], ['Project', r.project], ['Client', r.client || ''], ['Period from', r.from], ['Period to', r.to], ['Name', r.name], ['Institution', r.institution], ['Position', r.position], ['Claim currency', r.currency], ['Status', r.status === 'submitted' ? 'Submitted' : 'Draft'], [],
     ['No', 'Date', 'Merchant', 'Description', 'Expense code', 'Category', 'Receipt currency', 'Receipt amount', r.currency + ' per 1 unit', 'Amount ' + r.currency, 'Line type', 'Exchange rate as entered', 'Client', 'Attendees', 'Card or bank line']];
-  k.rows.forEach(x => a.push([x.n, x.rc.date, x.rc.merchant, x.kind === 'alc' ? 'Alcohol portion of this receipt' : descOf(x.rc), x.code, label(x.code), x.rc.currency, x.orig, x.rc.currency === r.currency ? 1 : x.rc.rate, x.base, x.kind === 'alc' ? 'Alcohol' : 'Expense', x.rc.currency === r.currency ? '' : rateLabel(x.rc, r.currency), x.rc.client || '', x.rc.attendees || '', cardNote(x.rc)]));
+  k.rows.forEach(x => a.push([x.n, x.rc.date, x.rc.merchant, x.kind === 'alc' ? 'Alcohol portion of this receipt' : descOf(x.rc, r), x.code, label(x.code), x.rc.currency, x.orig, x.rc.currency === r.currency ? 1 : x.rc.rate, x.base, x.kind === 'alc' ? 'Alcohol' : 'Expense', x.rc.currency === r.currency ? '' : rateLabel(x.rc, r.currency), clientOf(x.rc, r), x.rc.attendees || '', cardNote(x.rc)]));
   a.push(['', '', '', '', '', '', '', '', 'Total', k.total]);
   const pp = payOf(r, k.total);
   if (pp) { a.push(['', '', '', '', '', '', '', '', 'Payment ' + pp.currency, pp.amount]); a.push(['', '', '', '', '', '', '', '', 'Rate', pp.label + ', ' + (pp.source || '') + ' middle rate of ' + pp.date]); }
@@ -596,35 +627,81 @@ function render() {
   if (!S.ready) { v.innerHTML = '<p class="mut">' + (S.slow ? 'Saved data cannot be reached yet. The page keeps trying.' : 'Loading saved reports…') + '</p>'; return; }
   v.innerHTML = (S.err ? '<p class="note bad">' + esc(S.err) + '</p>' : '') + (rt === 'report' ? viewReport(cur()) : rt === 'setup' ? viewSetup() : viewList());
   hydrate(v);
+  if (S.openAfter && rt === 'report') { const o = S.openAfter, rc = (cur().receipts || []).find(x => x.id === o.id); S.openAfter = null; if (rc) { E = {isNew: false, rc: clone(rc), msg: o.msg, fresh: true}; rcSheet(); } }
 }
 function viewList() {
-  const rs = Object.values(S.reports).sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''));
-  const rows = rs.map(r => { const k = calc(r); return '<li><button class="rep" data-act="open" data-id="' + esc(r.id) + '"><span class="no">' + esc(r.number) + ' <span class="chip ' + (r.status === 'submitted' ? 'ok' : '') + '">' + (r.status === 'submitted' ? 'Submitted' : 'Draft') + '</span></span><span class="amt">' + esc(money(k.total, r.currency)) + '</span><span class="sm">' + esc(r.project || 'No project') + '</span><span class="sm mut r">' + k.count + (k.count === 1 ? ' receipt' : ' receipts') + '</span><span class="sm mut">' + esc(r.entityName) + '</span><span class="sm mut r">' + esc(fd(r.from)) + ' to ' + esc(fd(r.to)) + '</span></button></li>'; }).join('');
-  return '<div class="head"><h1>Reports</h1><button class="btn pri" data-act="new">New report</button></div>' +
-    (rs.length ? '<ul class="list">' + rows + '</ul>' : '<div class="empty"><h2>No reports yet</h2><p class="mut">A report belongs to one entity and one project. Its number is assigned on creation, and receipts are added by photo afterwards.</p><button class="btn pri" data-act="new">Start the first report</button></div>') +
+  const rs = claimReports().sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || '')), idx = dupIndex(), P = pool();
+  const rows = rs.map(r => { const k = calc(r), fl = flaggedIn(r, idx).length; return '<li><button class="rep" data-act="open" data-id="' + esc(r.id) + '"><span class="no">' + esc(r.number) + ' <span class="chip ' + (r.status === 'submitted' ? 'ok' : '') + '">' + (r.status === 'submitted' ? 'Submitted' : 'Draft') + '</span>' + (fl ? ' <span class="chip bad">' + fl + ' flagged</span>' : '') + '</span><span class="amt">' + esc(money(k.total, r.currency)) + '</span><span class="sm">' + esc(r.project || 'No project') + (r.client ? ', ' + esc(r.client) : '') + '</span><span class="sm mut r">' + k.count + (k.count === 1 ? ' receipt' : ' receipts') + '</span><span class="sm mut">' + esc(r.entityName) + '</span><span class="sm mut r">' + esc(fd(r.from)) + ' to ' + esc(fd(r.to)) + '</span></button></li>'; }).join('');
+  const poolRow = P ? (k => { const fl = flaggedIn(P, idx).length; return '<ul class="list"><li><button class="rep pool" data-act="open" data-id="' + POOL + '"><span class="no">Business development pool' + (fl ? ' <span class="chip bad">' + fl + ' flagged</span>' : '') + '</span><span class="amt">' + esc(money(k.total, P.currency)) + '</span><span class="sm mut">No client or project yet</span><span class="sm mut r">' + k.count + (k.count === 1 ? ' receipt' : ' receipts') + '</span></button></li></ul>'; })(calc(P))
+    : '<div class="btns"><button class="btn quiet" data-act="new-pool">Open the business development pool</button></div>';
+  return viewDash() + '<div class="head"><h1>Reports</h1><button class="btn pri" data-act="new">New report</button></div>' + poolRow +
+    (rs.length ? '<ul class="list">' + rows + '</ul>' : '<div class="empty"><h2>No reports yet</h2><p class="mut">A report belongs to one entity, one client and one project. Its number is assigned on creation, and receipts are added by photo afterwards. Spending without a client or project yet goes into the business development pool.</p><button class="btn pri" data-act="new">Start the first report</button></div>') +
     (store.mode === 'local' ? '<p class="note">Reports are saved on this device only. A backup file can be made under Setup.</p>' : '');
 }
+/* internal dashboard: never printed on a report; entities are marked reimbursed or sweat equity here only */
+function dashData(D) {
+  const L = {draft: 0, sub: 0, sweat: 0, pool: 0}, years = new Set([YEAR]); let noRate = 0, noFx = 0;
+  const toD = (amt, c) => { if (c === D.cur) return amt; const k = +D.rate; if (!(k > 0)) { noFx++; return 0; } return D.cur === 'SGD' ? amt / k : amt * k; };
+  for (const r of Object.values(S.reports)) {
+    const ent = S.settings.entities.find(e => e.id === r.entityId), line = isPool(r) ? 'pool' : ent && ent.sweat ? 'sweat' : r.status === 'submitted' ? 'sub' : 'draft';
+    for (const x of calc(r).rows) {
+      const y = (x.rc.date || '').slice(0, 4); if (y) years.add(+y);
+      if (D.year !== 'all' && y !== String(D.year)) continue;
+      if (!x.rate) { if (x.kind === 'main') noRate++; continue; }
+      L[line] += toD(x.base, r.currency);
+    }
+  }
+  return {L, years: [...years].sort((a, b) => b - a), noRate, noFx};
+}
+function viewDash() {
+  const D = Object.assign({cur: 'SGD', rate: '', year: YEAR}, S.settings.dash || {}), other = D.cur === 'SGD' ? 'IDR' : 'SGD', x = dashData(D), L = x.L, tot = L.draft + L.sub + L.sweat + L.pool;
+  const line = (t, v, cls) => '<tr' + (cls ? ' class="' + cls + '"' : '') + '><td>' + t + '</td><td class="r num">' + esc(fmt(v, D.cur)) + '</td></tr>';
+  const ents = S.settings.entities.map(e => '<label class="tog"><span>' + esc(e.name) + '</span><select data-dash-ent="' + esc(e.id) + '"><option value=""' + (e.sweat ? '' : ' selected') + '>Reimbursed</option><option value="1"' + (e.sweat ? ' selected' : '') + '>Sweat equity</option></select></label>').join('');
+  return '<details class="dash" id="dash"' + (S.dashOpen ? ' open' : '') + '><summary><span>Spending overview</span><b class="num">' + esc(money(tot, D.cur)) + '</b></summary>' +
+    '<p class="mut sm">Internal only. Nothing here appears on any report, PDF or Excel file.</p>' +
+    '<div class="three"><label class="f">Year<select id="d-year"><option value="all"' + (D.year === 'all' ? ' selected' : '') + '>All years</option>' + x.years.map(y => '<option' + (String(D.year) === String(y) ? ' selected' : '') + '>' + y + '</option>').join('') + '</select></label>' +
+    '<label class="f">Shown in<select id="d-cur">' + CLAIM_CURS.map(c => '<option' + (c === D.cur ? ' selected' : '') + '>' + c + '</option>').join('') + '</select></label>' +
+    '<label class="f">1 SGD = … IDR<input id="d-rate" type="number" step="any" min="0" inputmode="decimal" value="' + esc(D.rate || '') + '" placeholder="Rate"></label></div>' +
+    '<table><tbody>' + line('Reimbursable, not yet submitted', L.draft) + line('Reimbursable, submitted', L.sub) + line('Sweat equity (not reimbursed)', L.sweat) + line('Business development pool (unassigned)', L.pool) + '</tbody><tfoot>' + line('Total', tot) + '</tfoot></table>' +
+    (x.noFx ? '<p class="note bad sm">Some spending is in ' + other + ' and is left out until the rate 1 SGD = … IDR is typed above.</p>' : '') +
+    (x.noRate ? '<p class="note sm">' + x.noRate + (x.noRate === 1 ? ' receipt has' : ' receipts have') + ' no exchange rate yet and ' + (x.noRate === 1 ? 'is' : 'are') + ' not counted.</p>' : '') +
+    '<h3>Entities and clients</h3><div class="togs">' + ents + '</div></details>';
+}
 function viewReport(r) {
-  const k = calc(r), open = r.status !== 'submitted';
+  const P = isPool(r), yr = P ? (S.poolYear || 'all') : 'all', view = P && yr !== 'all' ? {...r, receipts: (r.receipts || []).filter(rc => (rc.date || '').slice(0, 4) === String(yr))} : r;
+  const k = calc(view), open = r.status !== 'submitted', idx = dupIndex(), flagged = flaggedIn(r, idx).length;
   const groups = []; k.rows.forEach(x => { const g = groups[groups.length - 1]; if (g && g.rc === x.rc) g.rows.push(x); else groups.push({rc: x.rc, n: x.n, rows: [x]}); });
   const list = groups.map(g => { const rc = g.rc, main = g.rows.find(x => x.kind === 'main'), alc = g.rows.find(x => x.kind === 'alc'), base = g.rows.reduce((s, x) => s + x.base, 0), needRate = rc.currency !== r.currency && !(+rc.rate > 0);
     return '<li><button class="rc" data-act="edit-rc" data-id="' + esc(rc.id) + '">' + (rc.img ? '<img class="th" alt="" data-ref="' + esc(rc.img) + '">' : '<span class="th none">No photo</span>') +
       '<span class="m">' + esc(rc.merchant || 'Unnamed merchant') + '</span><span class="a num">' + esc(money(rc.total, rc.currency)) + '</span>' +
-      '<span class="sub"><span>' + esc(fd(rc.date)) + (descOf(rc) ? ', ' + esc(descOf(rc)) : '') + (rc.card ? ' <span class="chip">' + (rc.card.kind === 'bank' ? 'Bank' : 'Card') + '</span>' : '') + '</span>' + (rc.currency !== r.currency ? '<span class="num">' + (needRate ? '<span class="chip warn">Rate needed</span>' : esc(money(base, r.currency)) + '<br><span class="sm">' + esc(rateLabel(rc, r.currency)) + '</span>') + '</span>' : '') + '</span>' +
+      (dupOthers(rc, idx).length ? '<span class="sub"><span class="chip bad">Possible duplicate: ' + esc(dupText(dupOthers(rc, idx), r)) + '</span></span>' : '') +
+      '<span class="sub"><span>' + esc(fd(rc.date)) + (descOf(rc, r) ? ', ' + esc(descOf(rc, r)) : '') + (rc.card ? ' <span class="chip">' + (rc.card.kind === 'bank' ? 'Bank' : 'Card') + '</span>' : '') + '</span>' + (rc.currency !== r.currency ? '<span class="num">' + (needRate ? '<span class="chip warn">Rate needed</span>' : esc(money(base, r.currency)) + '<br><span class="sm">' + esc(rateLabel(rc, r.currency)) + '</span>') + '</span>' : '') + '</span>' +
       '<span class="sub"><span>' + esc(rc.code) + ' ' + esc(label(rc.code)) + '</span>' + (main && alc ? '<span class="num">' + esc(fmt(main.orig, rc.currency)) + '</span>' : '') + '</span>' +
       (alc ? '<span></span><span class="sub"><span>' + esc(alc.code) + ' ' + esc(label(alc.code)) + '</span><span class="num">' + esc(fmt(alc.orig, rc.currency)) + '</span></span>' : '') + '</button></li>'; }).join('');
   const sum = Object.keys(k.by).sort().map(c => '<tr><td class="num">' + esc(c) + '</td><td>' + esc(label(c)) + '</td><td class="r num">' + esc(fmt(k.by[c], r.currency)) + '</td></tr>').join('');
+  const years = P ? [...new Set((r.receipts || []).map(rc => (rc.date || '').slice(0, 4)).filter(Boolean))].sort().reverse() : [];
+  const dupNote = flagged ? '<p class="note bad">' + flagged + (flagged === 1 ? ' receipt is' : ' receipts are') + ' flagged as a possible duplicate. ' + (P ? '' : 'PDF and Excel export stay locked until each flag is removed, or the receipt is moved or deleted.') + ' Opening a flagged receipt shows where its twin is.</p>' : '';
+  if (P) return '<p class="sm"><a href="#reports">All reports</a></p>' +
+    '<div class="head" style="margin-bottom:4px"><h1>Business development pool</h1><span class="chip">Pool</span></div>' +
+    '<p class="mut sm">Receipts for networking and business development with no client or project yet, kept in ' + esc(r.currency) + '. Each one moves into a client or project report once that exists ("Move to another report" inside the receipt). Nothing here is submitted.</p>' +
+    '<label class="f" style="max-width:220px">Year<select id="pool-year"><option value="all">All years</option>' + years.map(y => '<option' + (String(yr) === y ? ' selected' : '') + '>' + y + '</option>').join('') + '</select></label>' +
+    '<div class="total"><span>Unassigned' + (yr === 'all' ? '' : ' in ' + esc(yr)) + ', ' + k.count + (k.count === 1 ? ' receipt' : ' receipts') + '</span><b>' + esc(money(k.total, r.currency)) + '</b></div>' +
+    (k.missing ? '<p class="note bad">' + k.missing + (k.missing === 1 ? ' receipt has' : ' receipts have') + ' no exchange rate yet, so the total is incomplete.</p>' : '') + dupNote +
+    '<div class="btns fill"><label class="btn pri" for="cam">Take photo of receipt</label><label class="btn" for="lib">Choose a photo</label><label class="btn" for="doc">Choose a PDF or file</label><button class="btn quiet" data-act="manual">Enter by hand</button></div>' +
+    (canRead() ? '' : '<p class="note">' + (cap.viewer ? 'Automatic receipt reading is not available in this view.' : 'Automatic receipt reading needs an Anthropic API key, which is added under Setup.') + '</p>') +
+    '<section><h2>Receipts</h2>' + (groups.length ? '<ul class="list">' + list + '</ul>' : '<p class="mut">No receipts' + (yr === 'all' ? ' in the pool yet.' : ' dated ' + esc(yr) + '.') + '</p>') + '</section>' +
+    (groups.length ? '<section><h2>Summary by expense code</h2><table><thead><tr><th>Code</th><th>Category</th><th class="r">' + esc(r.currency) + '</th></tr></thead><tbody>' + sum + '</tbody><tfoot><tr><td></td><td>Total</td><td class="r num">' + esc(fmt(k.total, r.currency)) + '</td></tr></tfoot></table></section>' : '');
   return '<p class="sm"><a href="#reports">All reports</a></p>' +
     '<div class="head" style="margin-bottom:4px"><h1 class="num">' + esc(r.number) + '</h1><span class="chip ' + (open ? '' : 'ok') + '">' + (open ? 'Draft' : 'Submitted') + '</span></div>' +
-    '<dl class="meta"><dt>Entity</dt><dd>' + esc(r.entityName) + '</dd><dt>Project</dt><dd>' + esc(r.project || '-') + '</dd><dt>Period</dt><dd>' + esc(fd(r.from)) + ' to ' + esc(fd(r.to)) + '</dd><dt>Name</dt><dd>' + esc(r.name || '-') + '</dd><dt>Institution</dt><dd>' + esc(r.institution || '-') + '</dd><dt>Position</dt><dd>' + esc(r.position || '-') + '</dd></dl>' +
+    '<dl class="meta"><dt>Entity</dt><dd>' + esc(r.entityName) + '</dd><dt>Project</dt><dd>' + esc(r.project || '-') + '</dd><dt>Client</dt><dd>' + esc(r.client || '-') + '</dd><dt>Period</dt><dd>' + esc(fd(r.from)) + ' to ' + esc(fd(r.to)) + '</dd><dt>Name</dt><dd>' + esc(r.name || '-') + '</dd><dt>Institution</dt><dd>' + esc(r.institution || '-') + '</dd><dt>Position</dt><dd>' + esc(r.position || '-') + '</dd></dl>' +
     '<div class="total"><span>Total claim, ' + k.count + (k.count === 1 ? ' receipt' : ' receipts') + '</span><b>' + esc(money(k.total, r.currency)) + '</b></div>' +
     (payOf(r, k.total) ? (pp => '<div class="pay">Paid in ' + esc(pp.currency) + ': <b>' + esc(money(pp.amount, pp.currency)) + '</b><br><span class="mut sm">at ' + esc(pp.label) + ', ' + esc(pp.source || '') + ' middle rate of ' + esc(fd(pp.date)) + '</span></div>')(payOf(r, k.total)) : '') +
-    (k.missing ? '<p class="note bad">' + k.missing + (k.missing === 1 ? ' receipt has' : ' receipts have') + ' no exchange rate yet, so the total is incomplete and export is locked.</p>' : '') +
+    (k.missing ? '<p class="note bad">' + k.missing + (k.missing === 1 ? ' receipt has' : ' receipts have') + ' no exchange rate yet, so the total is incomplete and export is locked.</p>' : '') + dupNote +
     (open ? '<div class="btns fill"><label class="btn pri" for="cam">Take photo of receipt</label><label class="btn" for="lib">Choose a photo</label><label class="btn" for="doc">Choose a PDF or file</label><button class="btn quiet" data-act="manual">Enter by hand</button></div>' +
       (canRead() ? '' : '<p class="note">' + (cap.viewer ? 'Automatic receipt reading is not available in this view.' : 'Automatic receipt reading needs an Anthropic API key, which is added under Setup.') + ' A photo is still stored with the receipt, and the fields are filled by hand.</p>') : '') +
     '<section><h2>Receipts</h2>' + (groups.length ? '<ul class="list">' + list + '</ul>' : '<p class="mut">No receipts yet. A photo, a screenshot or a PDF of a receipt fills in the merchant, date, amount, category and any alcohol portion.</p>') + '</section>' +
     (groups.length ? '<section><h2>Summary by expense code</h2><table><thead><tr><th>Code</th><th>Category</th><th class="r">' + esc(r.currency) + '</th></tr></thead><tbody>' + sum + '</tbody><tfoot><tr><td></td><td>Total</td><td class="r num">' + esc(fmt(k.total, r.currency)) + '</td></tr></tfoot></table></section>' : '') +
-    '<section><h2>Submit</h2><div class="btns fill"><button class="btn pri" data-act="pdf"' + (!groups.length || k.missing ? ' disabled' : '') + '>PDF with receipts</button><button class="btn" data-act="xlsx"' + (!groups.length || k.missing ? ' disabled' : '') + '>Excel file</button></div>' +
+    '<section><h2>Submit</h2><div class="btns fill"><button class="btn pri" data-act="pdf"' + (!groups.length || k.missing || flagged ? ' disabled' : '') + '>PDF with receipts</button><button class="btn" data-act="xlsx"' + (!groups.length || k.missing || flagged ? ' disabled' : '') + '>Excel file</button></div>' +
     '<div class="btns" style="margin-top:12px">' + (open ? '<button class="btn quiet" data-act="edit-meta">Edit details</button>' : '') + '<button class="btn quiet" data-act="status">' + (open ? 'Mark as submitted' : 'Reopen as draft') + '</button><button class="btn danger" data-act="del-report">Delete report</button></div></section>';
 }
 function viewSetup() {
@@ -661,6 +738,7 @@ function metaSheet(r) {
       '<label class="f">Claim currency<span class="h">The predominant currency of the receipts. Every line is converted into it.</span><select id="m-cur">' + CLAIM_CURS.map(c => '<option' + (c === ent.currency ? ' selected' : '') + '>' + c + '</option>').join('') + '</select></label>'
       : '<p class="mut sm">' + esc(r.number) + ', ' + esc(r.entityName) + ', claim currency ' + esc(r.currency) + '</p>') +
     '<label class="f">Project<input id="m-project" list="projs" value="' + esc(isNew ? '' : r.project) + '" autocomplete="off"></label><datalist id="projs">' + projectList().map(x => '<option value="' + esc(x) + '">').join('') + '</datalist>' +
+    '<label class="f">Client<span class="h">The company served. It goes into the description of every receipt in this report. Optional.</span><input id="m-client" list="clients" value="' + esc(isNew ? '' : (r.client || '')) + '" placeholder="e.g. PT ABC" autocomplete="off"></label><datalist id="clients">' + clientList().map(x => '<option value="' + esc(x) + '">').join('') + '</datalist>' +
     '<div class="two"><label class="f">Period from<input id="m-from" type="date" value="' + esc(isNew ? t.slice(0, 8) + '01' : r.from) + '"></label><label class="f">Period to<input id="m-to" type="date" value="' + esc(isNew ? t : r.to) + '"></label></div>' +
     '<label class="f">Name<input id="m-name" value="' + esc(p.name || '') + '" autocomplete="name"></label>' +
     '<label class="f">Institution<input id="m-inst" value="' + esc(isNew ? (p.institution || ent.name) : r.institution) + '"></label>' +
@@ -712,7 +790,7 @@ function rcSheet() {
     '<label class="f">Merchant<input id="f-merchant" value="' + esc(rc.merchant) + '"></label>' +
     '<div class="two"><label class="f">Date<input id="f-date" type="date" value="' + esc(rc.date) + '"></label><label class="f">Currency<input id="f-cur" value="' + esc(rc.currency) + '" list="curs2" maxlength="3" autocapitalize="characters"></label></div><datalist id="curs2">' + CURS.map(c => '<option value="' + c + '">').join('') + '</datalist>' +
     '<label class="f">What was bought<input id="f-purpose" value="' + esc(rc.purpose) + '" placeholder="For example: dinner at Harbour Lane Kitchen"></label>' +
-    '<div class="two"><label class="f">Client<input id="f-client" list="clients" value="' + esc(rc.client || '') + '" placeholder="Company, e.g. PT ABC" autocomplete="off"></label><label class="f">Attendees<input id="f-att" value="' + esc(rc.attendees || '') + '" placeholder="Names, e.g. Budi Santoso, Rina Wijaya" autocomplete="off"></label></div><datalist id="clients">' + clientList().map(x => '<option value="' + esc(x) + '">').join('') + '</datalist>' +
+    '<label class="f">Attendees<span class="h">' + (r.client ? 'Client ' + esc(r.client) + ' comes from the report.' : isPool(r) ? 'The pool has no client; the client of the report it later moves into is used.' : 'This report names no client; it can be added under Edit details.') + '</span><input id="f-att" value="' + esc(rc.attendees || '') + '" placeholder="Names, e.g. Budi Santoso, Rina Wijaya" autocomplete="off"></label>' +
     '<label class="f" style="margin-bottom:0">Description</label><div class="desc' + (rc.descOverride ? ' ovr' : '') + '" id="f-desc"></div>' +
     '<div id="f-ovr-box"' + (rc.descOverride || E.ovr ? '' : ' hidden') + '><label class="f">Own description<span class="h">Replaces the automatic description. Empty means automatic.</span><textarea id="f-ovr">' + esc(rc.descOverride || '') + '</textarea></label></div>' +
     '<div class="btns" style="margin:0 0 14px"><button class="btn quiet" type="button" data-act="ovr" id="f-ovr-btn">' + (rc.descOverride || E.ovr ? 'Use automatic description' : 'Override description') + '</button></div>' +
@@ -720,14 +798,51 @@ function rcSheet() {
     '<label class="f">Expense code<select id="f-code"><option value="">Choose a code</option>' + opts + '</select></label>' +
     (meals.length > 1 ? '<div class="quick" id="f-quick">' + meals.map(c => '<button type="button" data-act="quick" data-code="' + esc(c.code) + '">' + esc(c.label) + '</button>').join('') + '</div>' : '') +
     '<div class="two"><label class="f">Receipt total<input id="f-total" type="number" step="any" min="0" inputmode="decimal" value="' + (rc.total || '') + '"></label><label class="f">Alcohol portion<span class="h">Includes its share of tax and service.</span><input id="f-alc" type="number" step="any" min="0" inputmode="decimal" value="' + (rc.alcohol || '') + '"></label></div>' +
-    '<div id="f-rate-row"><label class="f">Exchange rate written as<select id="f-dir"><option value="div"></option><option value="mul"></option></select></label>' +
+    '<div id="f-rate-row"><label class="f">Exchange rate written as<select id="f-dir"><option value="div"' + (rc.rateDir === 'div' ? ' selected' : '') + '></option><option value="mul"' + (rc.rateDir === 'mul' ? ' selected' : '') + '></option></select></label>' +
     '<label class="f">Middle rate of the receipt date<span class="h" id="f-rate-h"></span><input id="f-rate" type="number" step="any" min="0" inputmode="decimal" value="' + (rc.rateIn || rc.rate || '') + '"></label>' + linkHtml(['bi']) + '</div>' +
     '<div class="calc" id="f-calc"></div>' +
     (rc.card ? '' : '<details id="f-items-box"' + (E.itemsOpen ? ' open' : '') + '><summary>Items on the receipt (' + (rc.items || []).length + ')</summary><p class="mut sm" style="margin:0 0 8px">Text, amount and the alcohol mark can be corrected. Changing items recalculates the alcohol portion.</p><div id="f-items">' + (rc.items || []).map((it, i) => itemRow(it, i)).join('') + '</div><div class="btns"><button class="btn quiet" type="button" data-act="it-add">Add an item</button></div></details>') +
     '<label class="f">Note<textarea id="f-note">' + esc(rc.note) + '</textarea></label></fieldset>' +
     '<p id="f-err" class="note bad" hidden></p>' +
-    (locked ? '<p class="note">This report is marked as submitted. Reopen it as a draft to change receipts.</p>' : '<div class="btns"><button class="btn pri" data-act="save-rc" id="f-save"' + (E.reading ? ' disabled' : '') + '>Save receipt</button>' + (E.isNew ? '' : '<button class="btn danger" data-act="del-rc">Delete receipt</button>') + '</div>'));
+    (locked ? '<p class="note">This report is marked as submitted. Reopen it as a draft to change receipts.</p>' : (dupPanel(r) ? dupPanel(r) + (E.isNew ? '' : '<div class="btns"><button class="btn danger" data-act="del-rc">Delete receipt</button></div>') : '') || ('<div class="btns"><button class="btn pri" data-act="save-rc" id="f-save"' + (E.reading ? ' disabled' : '') + '>Save receipt</button>' + (E.isNew ? '' : '<button class="btn danger" data-act="del-rc">Delete receipt</button>') + '</div>' +
+      (E.isNew || E.reading ? '' : movePanel(r)))));
   hydrate(sheet); syncRc();
+}
+/* shown instead of the save button when the receipt matches another saved one */
+function dupPanel(r) {
+  if (!E || !E.dup) return '';
+  const others = E.dup, away = others.filter(x => x.r.id !== r.id), stuck = away.filter(x => x.r.status === 'submitted');
+  const where = others.map(x => '<li>' + esc(x.r.id === r.id ? (isPool(r) ? 'Elsewhere in the pool' : 'Elsewhere in this report') : (isPool(x.r) ? 'Business development pool' : x.r.number + (x.r.project ? ', ' + x.r.project : '') + (x.r.status === 'submitted' ? ' (submitted)' : ' (draft)'))) + ': ' + esc(x.rc.merchant) + ', ' + esc(fd(x.rc.date)) + ', ' + esc(money(x.rc.total, x.rc.currency)) + '</li>').join('');
+  return '<div class="dup" id="f-dup"><p><b>Possible duplicate.</b> A saved receipt has the same merchant, date and amount:</p><ul>' + where + '</ul>' +
+    (away.length && stuck.length ? '<p class="mut sm">Move is not possible while ' + esc(stuck.map(x => x.r.number).join(', ')) + ' is submitted. Reopening it as a draft allows the move.</p>' : '') +
+    '<div class="btns">' + (away.length ? '<button class="btn pri" data-act="dup-move"' + (stuck.length ? ' disabled' : '') + '>Move here</button>' : '') + '<button class="btn" data-act="dup-keep">Remove flag, keep both</button><button class="btn quiet" data-act="close">Cancel</button></div>' +
+    '<p class="mut sm">Move here takes the other copy out of ' + (away.length ? esc(away.map(x => placeName(x.r)).join(', ')) : 'its report') + ' and keeps this one. Remove flag keeps both as separate bills.</p></div>';
+}
+/* moving one saved receipt into the pool or another draft report */
+const moveTargets = r => Object.values(S.reports).filter(t => t.id !== r.id && (isPool(t) || t.status !== 'submitted')).sort((a, b) => (isPool(b) - isPool(a)) || (b.createdAt || '').localeCompare(a.createdAt || ''));
+function movePanel(r) {
+  const ts = moveTargets(r);
+  if (!E.mv) return '<div class="btns" style="margin-top:10px"><button class="btn quiet" data-act="mv-open">Move to another report</button></div>';
+  return '<div class="mv" id="f-mv"><h3>Move to another report</h3>' + (ts.length ? '<label class="f">Target<select id="mv-to">' + ts.map(t => '<option value="' + esc(t.id) + '">' + esc(isPool(t) ? 'Business development pool (' + t.currency + ')' : t.number + ', ' + (t.project || 'no project') + (t.client ? ', ' + t.client : '') + ' (' + t.currency + ')') + '</option>').join('') + '</select></label><div id="mv-warn"></div><p class="mut sm">The receipt is moved as last saved.</p><div class="btns"><button class="btn pri" data-act="mv-do">Move receipt</button><button class="btn quiet" data-act="mv-cancel">Cancel</button></div>'
+    : '<p class="mut">No other draft report or pool exists. Submitted reports must be reopened as drafts first.</p><div class="btns"><button class="btn quiet" data-act="mv-cancel">Cancel</button></div>') + '</div>';
+}
+function moveWarn() {
+  const el = $('#mv-warn'), sel = $('#mv-to'); if (!el || !sel) return;
+  const r = cur(), t = S.reports[sel.value], rc = (r.receipts || []).find(x => x.id === E.rc.id); if (!t || !rc) return;
+  const w = [];
+  if (!isPool(t) && rc.date && (rc.date < t.from || rc.date > t.to)) w.push('The receipt date ' + fd(rc.date) + ' is outside the period of ' + t.number + ' (' + fd(t.from) + ' to ' + fd(t.to) + '). The move is still possible.');
+  if (t.currency !== r.currency) { const m = moved(rc, r, t); w.push(m.currency === t.currency ? 'The claim currency changes from ' + r.currency + ' to ' + t.currency + '; the receipt counts with its ' + t.currency + ' amount ' + money(m.total, t.currency) + '.' : 'The claim currency changes from ' + r.currency + ' to ' + t.currency + '. The old rate is cleared and the middle rate of the receipt date for ' + m.currency + ' to ' + t.currency + ' is asked after the move.'); }
+  el.innerHTML = w.map(x => '<p class="note">' + esc(x) + '</p>').join('');
+}
+/* the receipt as it will sit in the target report */
+function moved(rc, r, t) {
+  const m = clone(rc);
+  if (t.currency !== r.currency) {
+    delete m.rateDir; m.rate = 0; m.rateIn = 0;
+    const hit = m.card && [m.card.charged, m.card.original].find(a => a && a.currency === t.currency);
+    if (hit) { m.currency = t.currency; m.total = rnd(hit.amount, t.currency); }
+  }
+  return m;
 }
 const itemRow = (it, i) => '<div class="it-row" data-i="' + i + '"><input class="it-d" value="' + esc(it.d) + '" aria-label="Item text"><input class="it-a" type="number" step="any" inputmode="decimal" value="' + (it.a || '') + '" aria-label="Item amount"><label><input class="it-alc" type="checkbox"' + (it.alc ? ' checked' : '') + '>Alc.</label><button class="x" type="button" data-act="it-del" aria-label="Remove item">×</button></div>';
 /* alcohol portion from the marked items, carrying their share of tax and service charge */
@@ -739,7 +854,7 @@ function alcFromItems(rc) {
 function pullRc() {
   if (!E || !$('#f-merchant')) return; const rc = E.rc, v = id => $(id).value.trim();
   rc.merchant = v('#f-merchant'); rc.date = v('#f-date'); rc.purpose = v('#f-purpose'); rc.code = v('#f-code'); rc.note = v('#f-note');
-  rc.client = v('#f-client'); rc.attendees = v('#f-att'); rc.descOverride = $('#f-ovr-box').hidden ? '' : v('#f-ovr');
+  rc.attendees = v('#f-att'); rc.descOverride = $('#f-ovr-box').hidden ? '' : v('#f-ovr');
   if ($('#f-items')) rc.items = [...sheet.querySelectorAll('#f-items .it-row')].map(el => ({d: el.querySelector('.it-d').value.trim().slice(0, 60), a: num(el.querySelector('.it-a').value), alc: el.querySelector('.it-alc').checked}));
   rc.currency = v('#f-cur').toUpperCase().replace(/[^A-Z]/g, ''); rc.total = rnd(num(v('#f-total')), rc.currency); rc.alcohol = rnd(num(v('#f-alc')), rc.currency);
   rc.rateDir = $('#f-dir').value || 'mul'; rc.rateIn = num(v('#f-rate')); rc.rate = rc.rateDir === 'div' ? (rc.rateIn > 0 ? 1 / rc.rateIn : 0) : rc.rateIn;
@@ -752,14 +867,14 @@ function syncRc() {
     /* a new currency gets its default direction and the last rate used for it */
     if (E.dirFor !== rc.currency) {
       const first = E.dirFor === undefined; E.dirFor = rc.currency;
-      if (!(first && E.rc.rateDir && rc.rateIn)) { const k = lastRate(rc.currency, r.currency); sel.value = k ? k.dir : defDir(rc.currency, r.currency); if (!first || !rc.rateIn) $('#f-rate').value = k ? k.val : ''; }
+      if (!(first && E.rc.rateDir && rc.rateIn)) { const k = E.fresh ? null : lastRate(rc.currency, r.currency); sel.value = k ? k.dir : defDir(rc.currency, r.currency); if (!first || !rc.rateIn) $('#f-rate').value = k ? k.val : ''; }
       else sel.value = E.rc.rateDir;
       pullRc();
     }
     $('#f-rate-h').textContent = rc.rateIn > 0 ? 'The same rate the other way: ' + (rc.rateDir === 'div' ? '1 ' + rc.currency + ' = ' + fmtRate(1 / rc.rateIn) + ' ' + r.currency : '1 ' + r.currency + ' = ' + fmtRate(1 / rc.rateIn) + ' ' + rc.currency) + '.' : (rc.rateDir === 'div' ? 'How many ' + rc.currency + ' for 1 ' + r.currency + '.' : 'How many ' + r.currency + ' for 1 ' + rc.currency + '.');
   }
   for (const b of sheet.querySelectorAll('#f-quick button')) b.classList.toggle('on', b.dataset.code === rc.code);
-  const dEl = $('#f-desc'); if (dEl) { dEl.textContent = descOf(rc) || 'Filled in from the fields above.'; dEl.classList.toggle('ovr', !!(rc.descOverride || '').trim()); }
+  const dEl = $('#f-desc'); if (dEl) { dEl.textContent = descOf(rc, cur()) || 'Filled in from the fields above.'; dEl.classList.toggle('ovr', !!(rc.descOverride || '').trim()); }
   const rate = foreign ? rc.rate : 1, alc = Math.min(rc.alcohol, rc.total), main = rnd(rc.total - alc, rc.currency), line = (amt, code) => '<div><b>' + esc(money(rnd(conv(amt, rc, r.currency), r.currency), r.currency)) + '</b> to ' + esc(code || 'no code yet') + ' ' + esc(label(code)) + '</div>';
   $('#f-calc').innerHTML = !rc.total ? '<span class="mut">The claim lines appear here once a total is entered.</span>' : foreign && !rate ? '<span class="mut">An exchange rate is needed to convert ' + esc(rc.currency) + ' into ' + esc(r.currency) + '.</span>' : (main > 0 || !alc ? line(main, rc.code) : '') + (alc > 0 ? line(alc, alcCode()) : '');
 }
@@ -832,6 +947,42 @@ async function selfTest(btn) {
 /* ---------- actions ---------- */
 const armed = b => { if (b.dataset.armed) return true; b.dataset.armed = '1'; b.dataset.t = b.textContent; b.textContent = 'Tap again to confirm'; setTimeout(() => { if (b.isConnected) { delete b.dataset.armed; b.textContent = b.dataset.t; } }, 4000); return false; };
 const go = h => { if (location.hash === '#' + h) render(); else location.hash = h; };
+async function saveRc(b, mode) {
+  pullRc(); const r = clone(cur()), rc = E.rc, err = t => { const e = $('#f-err'); e.textContent = t; e.hidden = false; e.scrollIntoView({block: 'center'}); };
+  if (E.block && !(rc.total > 0)) return err('This card line has no amount in the claim currency. Fill in the amount and a rate by hand, or close it.');
+  if (!rc.merchant) return err('The merchant name is needed.');
+  if (!rc.date) return err('The receipt date is needed.');
+  if (rc.currency.length !== 3) return err('The currency is a 3-letter code such as SGD, IDR or USD.');
+  if (!(rc.total > 0)) return err('The receipt total must be more than zero.');
+  if (rc.alcohol > rc.total) return err('The alcohol portion cannot be more than the receipt total.');
+  if (!rc.code) return err('An expense code is needed.');
+  if (rc.currency !== r.currency && !(rc.rate > 0)) return err('An exchange rate from ' + rc.currency + ' to ' + r.currency + ' is needed.');
+  if (rc.currency === r.currency) { rc.rate = 0; rc.rateIn = 0; delete rc.rateDir; }
+  rc.items = (rc.items || []).filter(i => i.d || i.a); if (!rc.descOverride) delete rc.descOverride;
+  /* one receipt, one report: a match stops the save until it is moved, kept on purpose, or cancelled */
+  const others = dupOthers(rc);
+  if (others.length && !mode) { E.dup = others; rcSheet(); const d = $('#f-dup'); if (d) d.scrollIntoView({block: 'center'}); return; }
+  const touched = {};
+  if (others.length && mode === 'keep') {
+    const add = (o, id) => { const l = (o.dupOk || '').split('~').filter(Boolean); if (!l.includes(id)) l.push(id); o.dupOk = l.join('~'); };
+    for (const x of others) { const t = x.r.id === r.id ? r : (touched[x.r.id] = touched[x.r.id] || clone(x.r)); const o = (t.receipts || []).find(y => y.id === x.rc.id); add(rc, x.rc.id); if (o) add(o, rc.id); }
+  }
+  const drop = [];
+  if (others.length && mode === 'move') {
+    for (const x of others.filter(y => y.r.id !== r.id)) { if (x.r.status === 'submitted') return err(x.r.number + ' is submitted. Reopen it as a draft to move the receipt.'); const t = touched[x.r.id] = touched[x.r.id] || clone(x.r); t.receipts = t.receipts.filter(y => y.id !== x.rc.id); drop.push(x.rc); }
+  }
+  b.disabled = true; b.textContent = 'Saving…';
+  if (E.upload) await E.upload;
+  const out = clone(rc), i = r.receipts.findIndex(x => x.id === out.id);
+  if (i >= 0) r.receipts[i] = out; else r.receipts.push(out);
+  E.isNew = false; closeSheet();
+  for (const t of Object.values(touched)) store.saveReport(t);
+  store.saveReport(r);
+  for (const o of drop) allImgs(o).forEach(ref => { if (!allImgs(out).includes(ref)) store.dropImage(ref); });
+  render();
+  if (drop.length) toast('Moved here. The copy in ' + Object.values(touched).map(placeName).join(', ') + ' was removed.');
+}
+/* a flagged receipt opened from the list shows the same choices before anything else */
 const acts = {
   new() { metaSheet(null); },
   open(b) { S.curId = b.dataset.id; try { sessionStorage.setItem('xp.cur', S.curId); } catch (e) {} go('report'); window.scrollTo(0, 0); },
@@ -844,7 +995,7 @@ const acts = {
     if (!from || !to) return err('Both period dates are needed.');
     if (from > to) return err('The period must end on or after the day it starts.');
     if (!v('#m-name')) return err('A name is needed.');
-    const f = {project: v('#m-project'), from, to, name: v('#m-name'), institution: v('#m-inst'), position: v('#m-pos')};
+    const f = {project: v('#m-project'), client: v('#m-client'), from, to, name: v('#m-name'), institution: v('#m-inst'), position: v('#m-pos')};
     let r;
     if (r0) r = Object.assign(clone(r0), f);
     else {
@@ -862,30 +1013,35 @@ const acts = {
     closeSheet(); if (!r0) store.saveSettings(); store.saveReport(r); go('report'); window.scrollTo(0, 0);
   },
   manual() { const r = cur(); E = {isNew: true, rc: {id: newId(), merchant: '', date: today(), purpose: '', code: '', currency: r.currency, total: 0, alcohol: 0, rate: 0, note: '', items: [], img: ''}}; rcSheet(); },
-  'edit-rc'(b) { const rc = (cur().receipts || []).find(x => x.id === b.dataset.id); if (!rc) return; E = {isNew: false, rc: clone(rc)}; rcSheet(); },
+  'edit-rc'(b) { const r = cur(), rc = (r.receipts || []).find(x => x.id === b.dataset.id); if (!rc) return; const o = dupOthers(rc); E = {isNew: false, rc: clone(rc), dup: o.length && r.status !== 'submitted' ? o : null}; rcSheet(); },
   quick(b) { $('#f-code').value = b.dataset.code; syncRc(); },
-  ovr() { const box = $('#f-ovr-box'), btn = $('#f-ovr-btn'); if (box.hidden) { box.hidden = false; if (!$('#f-ovr').value) $('#f-ovr').value = autoDesc(E.rc); btn.textContent = 'Use automatic description'; $('#f-ovr').focus(); } else { box.hidden = true; $('#f-ovr').value = ''; btn.textContent = 'Override description'; } syncRc(); },
+  ovr() { const box = $('#f-ovr-box'), btn = $('#f-ovr-btn'); if (box.hidden) { box.hidden = false; if (!$('#f-ovr').value) $('#f-ovr').value = autoDesc(E.rc, cur()); btn.textContent = 'Use automatic description'; $('#f-ovr').focus(); } else { box.hidden = true; $('#f-ovr').value = ''; btn.textContent = 'Override description'; } syncRc(); },
   'it-add'() { pullRc(); E.rc.items = (E.rc.items || []).concat({d: '', a: 0, alc: false}); E.itemsOpen = true; const box = $('#f-items'); box.insertAdjacentHTML('beforeend', itemRow({d: '', a: 0, alc: false}, E.rc.items.length - 1)); box.lastElementChild.querySelector('.it-d').focus(); },
   'it-del'(b) { b.closest('.it-row').remove(); pullRc(); $('#f-alc').value = alcFromItems(E.rc) || ''; syncRc(); },
   'skip-read'() { if (E && E.ctl) E.ctl.abort(); },
   'retry-read'() { if (E && E.blobs) { pullRc(); runRead(E); } },
-  async 'save-rc'(b) {
-    pullRc(); const r = clone(cur()), rc = E.rc, err = t => { const e = $('#f-err'); e.textContent = t; e.hidden = false; e.scrollIntoView({block: 'center'}); };
-    if (E.block && !(rc.total > 0)) return err('This card line has no amount in the claim currency. Fill in the amount and a rate by hand, or close it.');
-    if (!rc.merchant) return err('The merchant name is needed.');
-    if (!rc.date) return err('The receipt date is needed.');
-    if (rc.currency.length !== 3) return err('The currency is a 3-letter code such as SGD, IDR or USD.');
-    if (!(rc.total > 0)) return err('The receipt total must be more than zero.');
-    if (rc.alcohol > rc.total) return err('The alcohol portion cannot be more than the receipt total.');
-    if (!rc.code) return err('An expense code is needed.');
-    if (rc.currency !== r.currency && !(rc.rate > 0)) return err('An exchange rate from ' + rc.currency + ' to ' + r.currency + ' is needed.');
-    if (rc.currency === r.currency) { rc.rate = 0; rc.rateIn = 0; delete rc.rateDir; }
-    rc.items = (rc.items || []).filter(i => i.d || i.a); if (!rc.descOverride) delete rc.descOverride;
-    b.disabled = true; b.textContent = 'Saving…';
-    if (E.upload) await E.upload;
-    const out = clone(rc), i = r.receipts.findIndex(x => x.id === out.id);
-    if (i >= 0) r.receipts[i] = out; else r.receipts.push(out);
-    E.isNew = false; closeSheet(); store.saveReport(r); render();
+  async 'save-rc'(b) { await saveRc(b, ''); },
+  async 'dup-keep'(b) { await saveRc(b, 'keep'); },
+  async 'dup-move'(b) { await saveRc(b, 'move'); },
+  'mv-open'() { pullRc(); E.mv = true; rcSheet(); moveWarn(); const m = $('#f-mv'); if (m) m.scrollIntoView({block: 'center'}); },
+  'mv-cancel'() { pullRc(); E.mv = false; rcSheet(); },
+  'mv-do'(b) {
+    const r = clone(cur()), t = clone(S.reports[$('#mv-to').value]), rc = (r.receipts || []).find(x => x.id === E.rc.id);
+    if (!t || !rc || r.status === 'submitted' || t.status === 'submitted') return toast('Receipts move only between draft reports and the pool.');
+    const m = moved(rc, r, t), needRate = m.currency !== t.currency && !(+m.rate > 0), out = !isPool(t) && rc.date && (rc.date < t.from || rc.date > t.to);
+    r.receipts = r.receipts.filter(x => x.id !== rc.id); t.receipts = (t.receipts || []).concat(m);
+    b.disabled = true; closeSheet(); store.saveReport(r); store.saveReport(t);
+    const msg = 'Moved from ' + placeName(r) + ' to ' + placeName(t) + '.' + (out ? ' Its date is outside the period of ' + t.number + '.' : '');
+    if (needRate) { S.curId = t.id; try { sessionStorage.setItem('xp.cur', t.id); } catch (e) {} S.openAfter = {id: m.id, msg: msg + ' Type the middle rate of the receipt date for ' + m.currency + ' to ' + t.currency + ', then save.'}; go('report'); window.scrollTo(0, 0); }
+    else { render(); toast(msg); }
+  },
+  'new-pool'() {
+    openSheet('Business development pool', '<p class="mut">One holding place for receipts of networking and business development that have no client or project yet. They move into a client or project report later. The pool keeps one currency for its total; receipts in other currencies get the middle rate of their date.</p><label class="f">Pool currency<select id="pool-cur">' + CLAIM_CURS.map(c => '<option>' + c + '</option>').join('') + '</select></label><div class="btns"><button class="btn pri" data-act="make-pool">Open the pool</button></div>');
+  },
+  'make-pool'() {
+    if (pool()) { closeSheet(); return; }
+    const r = {id: POOL, kind: 'pool', number: 'Business development pool', project: 'Business development', entityName: 'Business development', currency: $('#pool-cur').value, status: 'draft', createdAt: new Date().toISOString(), receipts: []};
+    S.curId = POOL; try { sessionStorage.setItem('xp.cur', POOL); } catch (e) {} closeSheet(); store.saveReport(r); go('report'); window.scrollTo(0, 0);
   },
   'del-rc'(b) { if (!armed(b)) return; const r = clone(cur()), rc = r.receipts.find(x => x.id === E.rc.id); r.receipts = r.receipts.filter(x => x.id !== E.rc.id); closeSheet(); store.saveReport(r); if (rc) allImgs(rc).forEach(ref => store.dropImage(ref)); render(); },
   status() { const r = clone(cur()); if (r.status === 'submitted') { r.status = 'draft'; store.saveReport(r); render(); } else submitSheet(r); },
@@ -909,8 +1065,8 @@ const acts = {
     if (m && r.status !== 'submitted' && +S.settings.counters['L-' + m[1]] === +m[2]) { S.settings.counters['L-' + m[1]] = +m[2] - 1; store.saveSettings(); }
     S.curId = null; go('reports');
   },
-  async pdf(b) { const t = b.textContent; b.disabled = true; b.textContent = 'Building the PDF…'; try { const r = cur(); await deliver(r.number + '.pdf', await buildPdf(r)); } catch (e) { console.error(e); toast('The PDF could not be built: ' + (e.message || 'error')); } if (b.isConnected) { b.disabled = false; b.textContent = t; } },
-  async xlsx(b) { b.disabled = true; try { const r = cur(); await deliver(r.number + '.xlsx', buildXlsx(r)); } catch (e) { console.error(e); toast('The Excel file could not be built: ' + (e.message || 'error')); } if (b.isConnected) b.disabled = false; },
+  async pdf(b) { if (flaggedIn(cur()).length) return toast('A receipt is flagged as a possible duplicate. Export is locked until the flag is removed.'); const t = b.textContent; b.disabled = true; b.textContent = 'Building the PDF…'; try { const r = cur(); await deliver(r.number + '.pdf', await buildPdf(r)); } catch (e) { console.error(e); toast('The PDF could not be built: ' + (e.message || 'error')); } if (b.isConnected) { b.disabled = false; b.textContent = t; } },
+  async xlsx(b) { if (flaggedIn(cur()).length) return toast('A receipt is flagged as a possible duplicate. Export is locked until the flag is removed.'); b.disabled = true; try { const r = cur(); await deliver(r.number + '.xlsx', buildXlsx(r)); } catch (e) { console.error(e); toast('The Excel file could not be built: ' + (e.message || 'error')); } if (b.isConnected) b.disabled = false; },
   'add-code'() { $('#codes').insertAdjacentHTML('beforeend', codeRow({code: '', label: ''})); const rows = $('#codes').querySelectorAll('.row'); rows[rows.length - 1].querySelector('input').focus(); },
   'del-code'(b) { const row = b.closest('.row'); if (row.querySelector('[name=calc]').checked) return toast('The alcohol code cannot be removed. Mark another code for alcohol first.'); row.remove(); },
   'reset-codes'(b) { if (!armed(b)) return; $('#codes').innerHTML = STD_CODES.map(codeRow).join(''); toast('Standard chart restored. Save setup to keep it.'); },
@@ -948,7 +1104,7 @@ const acts = {
 };
 function readSetup(quiet) {
   const bad = t => { if (!quiet) toast(t); return null; };
-  const entities = [...document.querySelectorAll('#ents .ent')].map(el => ({id: el.dataset.ent, name: el.querySelector('[name=ename]').value.trim(), prefix: el.querySelector('[name=eprefix]').value.trim().toUpperCase().replace(/[^A-Z0-9]/g, ''), currency: el.querySelector('[name=ecur]').value}));
+  const entities = [...document.querySelectorAll('#ents .ent')].map(el => ({id: el.dataset.ent, name: el.querySelector('[name=ename]').value.trim(), prefix: el.querySelector('[name=eprefix]').value.trim().toUpperCase().replace(/[^A-Z0-9]/g, ''), currency: el.querySelector('[name=ecur]').value, ...((S.settings.entities.find(x => x.id === el.dataset.ent) || {}).sweat ? {sweat: 1} : {})}));
   const next = Math.floor(num(($('#ledger-next') || {}).value));
   const codes = [...document.querySelectorAll('#codes .row')].map(el => { const c = {code: el.querySelector('[name=ccode]').value.trim(), label: el.querySelector('[name=clabel]').value.trim()}; if (el.querySelector('[name=calc]').checked) c.alcohol = 1; else if (el.querySelector('[name=clabel]').dataset.meal) c.meal = 1; return c; }).filter(c => quiet || c.code || c.label);
   if (quiet) return {entities, codes, next};
@@ -969,8 +1125,17 @@ function readSetup(quiet) {
 document.addEventListener('click', e => { const b = e.target.closest('[data-act]'); if (b && !b.disabled && acts[b.dataset.act]) acts[b.dataset.act](b, e); });
 sheet.addEventListener('input', e => {
   if (E && e.target.closest && e.target.closest('#f-items')) { pullRc(); const a = alcFromItems(E.rc); $('#f-alc').value = a || ''; }
+  if (e.target && e.target.id === 'mv-to') { moveWarn(); return; }
   syncRc();
 });
+/* dashboard and pool filters */
+document.addEventListener('change', e => {
+  const t = e.target; if (!t || sheet.contains(t)) return;
+  if (t.id === 'pool-year') { S.poolYear = t.value; render(); return; }
+  if (t.id === 'd-year' || t.id === 'd-cur' || t.id === 'd-rate') { const D = S.settings.dash = Object.assign({cur: 'SGD', rate: '', year: YEAR}, S.settings.dash || {}); if (t.id === 'd-year') D.year = t.value === 'all' ? 'all' : +t.value; if (t.id === 'd-cur') D.cur = t.value; if (t.id === 'd-rate') D.rate = num(t.value) > 0 ? num(t.value) : ''; store.saveSettings(); render(); return; }
+  if (t.dataset && t.dataset.dashEnt) { const en = S.settings.entities.find(x => x.id === t.dataset.dashEnt); if (en) { if (t.value) en.sweat = 1; else delete en.sweat; store.saveSettings(); render(); } }
+});
+document.addEventListener('click', e => { const sm = e.target.closest && e.target.closest('#dash > summary'); if (sm) S.dashOpen = !sm.parentElement.open; });
 $('#restore').addEventListener('change', e => { const f = e.target.files && e.target.files[0]; e.target.value = ''; if (f) readBackup(f); });
 for (const id of ['cam', 'lib', 'doc']) $('#' + id).addEventListener('change', e => { const f = e.target.files && e.target.files[0]; e.target.value = ''; if (f) addFromFile(f); });
 /* a photo dragged onto an open draft report is treated like a chosen photo (desktop use) */
